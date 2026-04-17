@@ -1,0 +1,7 @@
+Stopped backend process on port 3000 (PID 25160).
+Stopped backend process on port 3000 (PID 0).
+Stopped backend process on port 3000 (PID 11896).
+◇ injected env (19) from .env // tip: ⌘ suppress logs { quiet: true }
+PostgreSQL connected successfully
+Models synchronized successfully
+Server running on port 3000

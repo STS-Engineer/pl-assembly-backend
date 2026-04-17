@@ -1,0 +1,379 @@
+const fs = require('fs')
+const path = require('path')
+const nodemailer = require('nodemailer')
+
+const BRAND_LOGO_CID = 'pl-assembly-brand-logo'
+const brandLogoPath = path.join(__dirname, '..', '..', 'frontend', 'public', 'img', 'logo.PNG')
+
+function normalizeBoolean(value, defaultValue = false) {
+  if (typeof value === 'boolean') {
+    return value
+  }
+
+  if (typeof value !== 'string') {
+    return defaultValue
+  }
+
+  if (value === 'true') {
+    return true
+  }
+
+  if (value === 'false') {
+    return false
+  }
+
+  return defaultValue
+}
+
+function normalizeBaseUrl(value) {
+  return String(value || `http://localhost:${process.env.PORT || 3000}`).replace(/\/+$/, '')
+}
+
+function getTransporter() {
+  const host = process.env.SMTP_HOST
+  const port = Number(process.env.SMTP_PORT || 587)
+  const secure = normalizeBoolean(process.env.SMTP_SECURE, port === 465)
+  const rejectUnauthorized = normalizeBoolean(process.env.SMTP_TLS_REJECT_UNAUTHORIZED, false)
+
+  if (!host) {
+    throw new Error('SMTP_HOST is required to send emails.')
+  }
+
+  const transportConfig = {
+    host,
+    port,
+    secure,
+    tls: {
+      rejectUnauthorized,
+    },
+  }
+
+  if (process.env.SMTP_USER || process.env.SMTP_PASS) {
+    transportConfig.auth = {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    }
+  }
+
+  return nodemailer.createTransport(transportConfig)
+}
+
+function getFromEmail() {
+  return process.env.SMTP_FROM || process.env.SMTP_USER
+}
+
+function getAdminEmail() {
+  return process.env.ADMIN_EMAIL || process.env.SMTP_FROM || process.env.SMTP_USER
+}
+
+function normalizeRecipients(value) {
+  if (Array.isArray(value)) {
+    return value.filter(Boolean)
+  }
+
+  if (!value) {
+    return []
+  }
+
+  return [value].filter(Boolean)
+}
+
+function resolveAdminRecipients(adminEmails = []) {
+  const recipients = [...normalizeRecipients(adminEmails), ...normalizeRecipients(getAdminEmail())]
+  return [...new Set(recipients.map((recipient) => String(recipient || '').trim().toLowerCase()).filter(Boolean))]
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+async function sendMail({ to, subject, text, html, attachments = [] }) {
+  const from = getFromEmail()
+
+  if (!from) {
+    throw new Error('SMTP_FROM or SMTP_USER is required to send emails.')
+  }
+
+  if (!to) {
+    throw new Error('Recipient email is required.')
+  }
+
+  const transporter = getTransporter()
+
+  return transporter.sendMail({
+    from,
+    to,
+    subject,
+    text,
+    html,
+    attachments,
+  })
+}
+
+function getBrandLogoAttachment() {
+  if (!fs.existsSync(brandLogoPath)) {
+    return []
+  }
+
+  return [
+    {
+      filename: 'logo.PNG',
+      path: brandLogoPath,
+      cid: BRAND_LOGO_CID,
+    },
+  ]
+}
+
+function renderEmailShell({ eyebrow, title, intro, contentHtml, actionLabel, actionUrl, footerNote }) {
+  const logoHtml = fs.existsSync(brandLogoPath)
+    ? `
+        <div style="display:grid;place-items:center;width:92px;min-width:92px;padding:8px;margin-right:8px;margin-bottom:8px;border-radius:16px;background:rgba(255,255,255,0.96);box-shadow:0 16px 34px rgba(8,31,49,0.12);">
+          <img src="cid:${BRAND_LOGO_CID}" alt="PL Assembly" style="display:block;width:100%;height:auto;" />
+        </div>
+      `
+    : `
+        <div style="display:grid;place-items:center;width:92px;min-width:92px;margin-right:8px;margin-bottom:8px;border-radius:16px;background:rgba(255,255,255,0.96);box-shadow:0 16px 34px rgba(8,31,49,0.12);font-family:'Trebuchet MS','Segoe UI',Calibri,Arial,sans-serif;font-weight:700;color:#081e2f;">
+          PL
+        </div>
+      `
+
+  const actionHtml = actionLabel && actionUrl
+    ? `
+        <div style="margin-top:28px;">
+          <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="260" style="border-collapse:separate !important;">
+            <tr>
+              <td
+                align="center"
+                valign="middle"
+                width="260"
+                height="52"
+                bgcolor="#ef7807"
+                style="width:260px;height:52px;background:#ef7807 !important;background-color:#ef7807 !important;border:1px solid #ef7807;border-radius:26px;mso-padding-alt:0;"
+              >
+                <a
+                  href="${escapeHtml(actionUrl)}"
+                  target="_blank"
+                  style="display:block;width:260px;height:52px;line-height:52px;border-radius:26px;background:#ef7807 !important;background-color:#ef7807 !important;color:#ffffff !important;text-align:center;text-decoration:none;font-family:'Segoe UI',Calibri,'Trebuchet MS',Arial,sans-serif;font-size:15px;font-weight:800;-webkit-text-size-adjust:none;"
+                >
+                  <font color="#ffffff">${escapeHtml(actionLabel)}</font>
+                </a>
+              </td>
+            </tr>
+          </table>
+        </div>
+      `
+    : ''
+
+  return `
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>${title}</title>
+      </head>
+      <body style="margin:0;padding:0;background:
+        radial-gradient(circle at top left, rgba(4,110,175,0.08), transparent 26%),
+        radial-gradient(circle at bottom right, rgba(239,120,7,0.10), transparent 24%),
+        linear-gradient(180deg, #f8f4ee 0%, #f3ede5 100%);
+        color:#162231;
+        font-family:'Segoe UI',Calibri,'Trebuchet MS',Arial,sans-serif;"
+      >
+        <div style="padding:32px 16px;">
+          <div style="max-width:460px;margin:0 auto;">
+            <div style="border-radius:28px;background:rgba(255,255,255,0.96);border:1px solid rgba(14,78,120,0.08);box-shadow:0 18px 44px rgba(8,31,49,0.10);padding:30px;">
+              <div style="display:flex;flex-direction:column;gap:12px;align-items:flex-start;">
+                <div style="display:flex;align-items:center;gap:14px;">
+                  ${logoHtml}
+                  <div style="display:flex;flex-direction:column;gap:2px;text-align:left;">
+                    <span style="font-family:'Trebuchet MS','Segoe UI',Calibri,Arial,sans-serif;font-size:1.2rem;font-weight:700;line-height:1.1;color:#081e2f;">PL Assembly</span>
+                    <span style="max-width:260px;font-size:0.92rem;line-height:1.4;color:#53697b;">Workflow access & validations</span>
+                  </div>
+                </div>
+
+                <span style="display:inline-flex;width:fit-content;padding:8px 12px;border-radius:999px;background:rgba(14,78,120,0.10);color:#0e4e78;text-transform:uppercase;letter-spacing:0.12em;font-size:0.76rem;font-weight:800;">
+                  ${eyebrow}
+                </span>
+
+                <h1 style="margin:0;font-family:'Trebuchet MS','Segoe UI',Calibri,Arial,sans-serif;font-size:2rem;font-weight:700;line-height:1.12;letter-spacing:-0.03em;color:#081e2f;">
+                  ${title}
+                </h1>
+
+                <p style="margin:0;font-size:1rem;line-height:1.6;color:#53697b;">
+                  ${intro}
+                </p>
+              </div>
+
+              <div style="margin-top:22px;">
+                ${contentHtml}
+                ${actionHtml}
+              </div>
+
+              <div style="margin-top:22px;padding-top:18px;border-top:1px solid rgba(14,78,120,0.12);font-size:0.95rem;line-height:1.6;color:#53697b;">
+                ${footerNote}
+              </div>
+            </div>
+          </div>
+        </div>
+      </body>
+    </html>
+  `
+}
+
+function renderDetailRow(label, value) {
+  return `
+    <tr>
+      <td style="padding:0 0 12px 0;font-size:0.95rem;font-weight:700;color:#0a3452;vertical-align:top;width:112px;">${escapeHtml(label)}</td>
+      <td style="padding:0 0 12px 0;font-size:0.98rem;color:#162231;">${escapeHtml(value)}</td>
+    </tr>
+  `
+}
+
+function getPasswordResetUrl(resetToken) {
+  const encodedToken = encodeURIComponent(resetToken)
+
+  if (process.env.FRONTEND_URL) {
+    return `${normalizeBaseUrl(process.env.FRONTEND_URL)}/reset-password/${encodedToken}`
+  }
+
+  return `${normalizeBaseUrl(process.env.BACKEND_URL)}/api/users/reset-password/${encodedToken}`
+}
+
+async function sendAdminApprovalRequest(user, approvalToken) {
+  const recipients = resolveAdminRecipients(user.adminEmails)
+  const approvalUrl = `${normalizeBaseUrl(process.env.BACKEND_URL)}/api/users/approve-account/${encodeURIComponent(approvalToken)}`
+  const fullName = user.full_name || 'Unknown user'
+  const email = user.email || 'No email provided'
+
+  if (recipients.length === 0) {
+    throw new Error('At least one admin recipient is required to notify the administrator.')
+  }
+
+  const html = renderEmailShell({
+    eyebrow: 'Account approval',
+    title: 'A new account is waiting for validation',
+    intro: 'A user has created an account in PL Assembly and needs an administrator approval before sign in is allowed.',
+    contentHtml: `
+      <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+          ${renderDetailRow('Full name', fullName)}
+          ${renderDetailRow('Email', email)}
+        </table>
+      </div>
+      <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
+        Once this account is approved, the user will receive a confirmation email and will be able to sign in.
+      </p>
+    `,
+    actionLabel: 'Approve this account',
+    actionUrl: approvalUrl,
+    footerNote: `
+      If the button does not work, copy this link into your browser:<br />
+      <a href="${approvalUrl}" style="color:#ef7807;text-decoration:none;font-weight:700;">${approvalUrl}</a>
+    `,
+  })
+
+  return sendMail({
+    to: recipients.join(', '),
+    subject: 'New account pending approval',
+    text: [
+      'A new user account is waiting for approval.',
+      '',
+      `Name: ${fullName}`,
+      `Email: ${email}`,
+      '',
+      `Approve this account: ${approvalUrl}`,
+    ].join('\n'),
+    html,
+    attachments: getBrandLogoAttachment(),
+  })
+}
+
+async function sendUserApprovalConfirmation(user) {
+  const fullName = user.full_name || 'User'
+  const signInUrl = process.env.FRONTEND_URL ? `${normalizeBaseUrl(process.env.FRONTEND_URL)}/` : ''
+
+  const html = renderEmailShell({
+    eyebrow: 'Account approved',
+    title: 'Your account has been approved',
+    intro: 'Good news. Your PL Assembly access has been validated by an administrator.',
+    contentHtml: `
+      <div style="border-radius:20px;background:#eaf7ef;border:1px solid rgba(29,93,54,0.16);padding:18px;">
+        <p style="margin:0;font-size:1rem;line-height:1.6;color:#1d5d36;">
+          Hello <strong>${escapeHtml(fullName)}</strong>, your account has been approved. You can now sign in.
+        </p>
+      </div>
+    `,
+    actionLabel: signInUrl ? 'Go to sign in' : '',
+    actionUrl: signInUrl,
+    footerNote: 'If you did not request this account, please contact your administrator.',
+  })
+
+  return sendMail({
+    to: user.email,
+    subject: 'Your account has been approved',
+    text: [
+      `Hello ${fullName},`,
+      '',
+      'Your account has been approved.',
+      'You can now sign in.',
+    ].join('\n'),
+    html,
+    attachments: getBrandLogoAttachment(),
+  })
+}
+
+async function sendUserPasswordResetEmail(user, resetToken) {
+  const fullName = user.full_name || 'User'
+  const resetUrl = getPasswordResetUrl(resetToken)
+
+  const html = renderEmailShell({
+    eyebrow: 'Password reset',
+    title: 'Reset your password',
+    intro: 'We received a request to reset your PL Assembly password.',
+    contentHtml: `
+      <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px;">
+        <p style="margin:0;font-size:1rem;line-height:1.6;color:#162231;">
+          Hello <strong>${escapeHtml(fullName)}</strong>, use the button below to create a new password for your account.
+        </p>
+      </div>
+      <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
+        This password reset link is time-sensitive. If you did not request a password reset, you can safely ignore this email.
+      </p>
+    `,
+    actionLabel: 'Reset my password',
+    actionUrl: resetUrl,
+    footerNote: `
+      If the button does not work, copy this link into your browser:<br />
+      <a href="${resetUrl}" style="color:#ef7807;text-decoration:none;font-weight:700;">${resetUrl}</a>
+    `,
+  })
+
+  return sendMail({
+    to: user.email,
+    subject: 'Reset your password',
+    text: [
+      `Hello ${fullName},`,
+      '',
+      'We received a request to reset your PL Assembly password.',
+      'Use the link below to create a new password:',
+      resetUrl,
+      '',
+      'If you did not request a password reset, you can ignore this email.',
+    ].join('\n'),
+    html,
+    attachments: getBrandLogoAttachment(),
+  })
+}
+
+module.exports = {
+  getPasswordResetUrl,
+  resolveAdminRecipients,
+  sendAdminApprovalRequest,
+  sendUserPasswordResetEmail,
+  sendUserApprovalConfirmation,
+}
