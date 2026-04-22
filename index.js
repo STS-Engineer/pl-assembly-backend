@@ -2,15 +2,31 @@ require('dotenv').config()
 
 const express = require('express')
 const cors = require('cors')
-const path = require('path')
+const cron = require('node-cron')
 const sequelize = require('./config/sequelize')
 const User = require('./models/user.model')
+const Notification = require('./models/notification.model')
 const Rfq = require('./models/rfq.model')
 const RfqCosting = require('./models/rfq-costing.model')
+const RfqCostingInitialSubElement = require('./models/rfq-costing-initial-sub-element.model')
+const emailService = require('./emails/email.service')
+const rfqCostingInitialSubElementService = require('./services/rfq-costing-initial-sub-element.service')
 
 const RFQCosting = require('./routes/rfq-costing.route')
+const notificationRoutes = require('./routes/notification.route')
+const rfqCostingInitialSubElementRoutes = require('./routes/rfq-costing-initial-sub-element.route')
 const userRoutes = require('./routes/user.route')
 const rfqRoutes = require('./routes/rfq.route')
+
+User.hasMany(Notification, {
+  foreignKey: 'user_id',
+  as: 'notifications',
+})
+
+Notification.belongsTo(User, {
+  foreignKey: 'user_id',
+  as: 'user',
+})
 
 Rfq.hasMany(RfqCosting, {
   foreignKey: 'rfq_id',
@@ -24,6 +40,16 @@ RfqCosting.belongsTo(Rfq, {
   as: 'rfq',
 })
 
+RfqCosting.hasMany(RfqCostingInitialSubElement, {
+  foreignKey: 'rfq_costing_id',
+  as: 'initial_sub_elements',
+})
+
+RfqCostingInitialSubElement.belongsTo(RfqCosting, {
+  foreignKey: 'rfq_costing_id',
+  as: 'costing',
+})
+
 const app = express()
 let httpServer = null
 let shutdownHandlersRegistered = false
@@ -32,10 +58,11 @@ app.use(cors())
 app.use(express.json({ limit: '1mb' }))
 
 app.use('/api/users', userRoutes)
+app.use('/api/notifications', notificationRoutes)
 app.use('/api/rfqs', rfqRoutes)
 app.use('/api/rfq-costing', RFQCosting)
-
-app.use('/api/upload', express.static(path.join(__dirname, 'upload')))
+app.use('/api/rfq-costing-initial-sub-elements', rfqCostingInitialSubElementRoutes)
+app.use('/api/rfqc-sub-element', rfqCostingInitialSubElementRoutes)
 
 app.get('/', (req, res) => {
   res.send('API is running')
@@ -45,8 +72,32 @@ app.get('/api/data', (req, res) => {
   res.json({ message: 'Hello from backend' })
 })
 
-app.get('/api/health', (req, res) => {
-  res.status(200).json({ status: 'ok' })
+app.post('/api/test-email', async (req, res) => {
+  try {
+    const { to, subject, message } = req.body
+
+    if (!to) {
+      return res.status(400).json({ message: 'Recipient email (to) is required' })
+    }
+
+    await emailService.sendMail({
+      to,
+      subject: subject || 'Test Email from PL Assembly',
+      text: message || 'This is a test email to verify SMTP configuration.',
+      html: `<p>${message || 'This is a test email to verify SMTP configuration.'}</p>`,
+    })
+
+    return res.status(200).json({
+      message: 'Test email sent successfully',
+      recipient: to,
+    })
+  } catch (error) {
+    console.error('Test email error:', error)
+    return res.status(500).json({
+      message: 'Failed to send test email',
+      error: error.message,
+    })
+  }
 })
 
 app.use((error, req, res, next) => {
@@ -131,6 +182,17 @@ async function startServer() {
 
   await User.ensureApprovalState()
   registerProcessHandlers()
+
+  // Configurer le cron job pour mettre à jour les statuts Late! à chaque minuit
+  cron.schedule('0 0 * * *', async () => {
+    console.log('📅 Running midnight late status update...')
+    try {
+      await rfqCostingInitialSubElementService.updateLateStatuses()
+    } catch (error) {
+      console.error('❌ Error in midnight late status update:', error.message)
+    }
+  })
+  console.log('📅 Cron job scheduled: updateLateStatuses will run every midnight')
 
   if (httpServer) {
     return httpServer

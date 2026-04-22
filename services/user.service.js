@@ -58,6 +58,22 @@ function createHttpError(statusCode, message) {
   return error
 }
 
+function extractBearerToken(authorizationHeader) {
+  const headerValue = String(authorizationHeader || '').trim()
+
+  if (!headerValue) {
+    throw createHttpError(401, 'Authentication is required.')
+  }
+
+  const [scheme, token] = headerValue.split(/\s+/)
+
+  if (scheme !== 'Bearer' || !token) {
+    throw createHttpError(401, 'Authentication is required.')
+  }
+
+  return token
+}
+
 function base64UrlEncode(value) {
   return Buffer.from(JSON.stringify(value)).toString('base64url')
 }
@@ -173,6 +189,31 @@ function buildAuthResponse(message, user) {
     accessToken: createAccessToken(user),
     expiresIn: TOKEN_DURATION_SECONDS,
   }
+}
+
+async function authenticateAccessToken(token) {
+  const payload = verifySignedToken(token)
+
+  if (payload.type !== 'access') {
+    throw createHttpError(401, 'Authentication is required.')
+  }
+
+  const user = await User.findById(payload.sub)
+
+  if (!user) {
+    throw createHttpError(401, 'Authentication is required.')
+  }
+
+  if (user.email !== payload.email) {
+    throw createHttpError(401, 'Authentication is required.')
+  }
+
+  return User.sanitizeUser(user)
+}
+
+async function authenticateAccessTokenFromHeader(authorizationHeader) {
+  const token = extractBearerToken(authorizationHeader)
+  return authenticateAccessToken(token)
 }
 
 async function signUp(payload) {
@@ -374,7 +415,10 @@ async function resetPasswordWithToken(token, payload) {
 
 module.exports = {
   approveUserAccount,
+  authenticateAccessToken,
+  authenticateAccessTokenFromHeader,
   changePassword,
+  extractBearerToken,
   forgotPassword,
   getAllUsers,
   getUserById,

@@ -1,6 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const nodemailer = require('nodemailer')
+const notificationService = require('../services/notification.service')
 
 const BRAND_LOGO_CID = 'pl-assembly-brand-logo'
 const brandLogoPath = path.join(__dirname, '..', '..', 'frontend', 'public', 'img', 'logo.PNG')
@@ -68,14 +69,17 @@ function getAdminEmail() {
 
 function normalizeRecipients(value) {
   if (Array.isArray(value)) {
-    return value.filter(Boolean)
+    return value.flatMap((entry) => normalizeRecipients(entry))
   }
 
   if (!value) {
     return []
   }
 
-  return [value].filter(Boolean)
+  return String(value)
+    .split(/[;,]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
 }
 
 function resolveAdminRecipients(adminEmails = []) {
@@ -90,6 +94,15 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;')
+}
+
+function getDisplayValue(value, fallback = 'N/A') {
+  const normalizedValue = String(value ?? '').trim()
+  return normalizedValue || fallback
+}
+
+function getWorkspaceCostingUrl() {
+  return `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/workspace/costing`
 }
 
 async function sendMail({ to, subject, text, html, attachments = [] }) {
@@ -107,6 +120,31 @@ async function sendMail({ to, subject, text, html, attachments = [] }) {
 
   return transporter.sendMail({
     from,
+    to,
+    subject,
+    text,
+    html,
+    attachments,
+  })
+}
+
+async function sendMailWithNotification({
+  to,
+  subject,
+  text,
+  html,
+  attachments = [],
+  notification = null,
+}) {
+  if (notification) {
+    try {
+      await notificationService.createNotificationsForRecipients(to, notification)
+    } catch (error) {
+      console.error('Unable to create frontend notifications for email recipients:', error.message)
+    }
+  }
+
+  return sendMail({
     to,
     subject,
     text,
@@ -185,7 +223,7 @@ function renderEmailShell({ eyebrow, title, intro, contentHtml, actionLabel, act
         font-family:'Segoe UI',Calibri,'Trebuchet MS',Arial,sans-serif;"
       >
         <div style="padding:32px 16px;">
-          <div style="max-width:460px;margin:0 auto;">
+          <div style="max-width:600px;margin:0 auto;">
             <div style="border-radius:28px;background:rgba(255,255,255,0.96);border:1px solid rgba(14,78,120,0.08);box-shadow:0 18px 44px rgba(8,31,49,0.10);padding:30px;">
               <div style="display:flex;flex-direction:column;gap:12px;align-items:flex-start;">
                 <div style="display:flex;align-items:center;gap:14px;">
@@ -214,9 +252,9 @@ function renderEmailShell({ eyebrow, title, intro, contentHtml, actionLabel, act
                 ${actionHtml}
               </div>
 
-              <div style="margin-top:22px;padding-top:18px;border-top:1px solid rgba(14,78,120,0.12);font-size:0.95rem;line-height:1.6;color:#53697b;">
+              ${footerNote ? `<div style="margin-top:22px;padding-top:18px;border-top:1px solid rgba(14,78,120,0.12);font-size:0.95rem;line-height:1.6;color:#53697b;">
                 ${footerNote}
-              </div>
+              </div>` : ''}
             </div>
           </div>
         </div>
@@ -249,6 +287,16 @@ async function sendAdminApprovalRequest(user, approvalToken) {
   const approvalUrl = `${normalizeBaseUrl(process.env.BACKEND_URL)}/api/users/approve-account/${encodeURIComponent(approvalToken)}`
   const fullName = user.full_name || 'Unknown user'
   const email = user.email || 'No email provided'
+  const intro =
+    'A user has created an account in PL Assembly and needs an administrator approval before sign in is allowed.'
+  const text = [
+    'A new user account is waiting for approval.',
+    '',
+    `Name: ${fullName}`,
+    `Email: ${email}`,
+    '',
+    `Approve this account: ${approvalUrl}`,
+  ].join('\n')
 
   if (recipients.length === 0) {
     throw new Error('At least one admin recipient is required to notify the administrator.')
@@ -257,7 +305,7 @@ async function sendAdminApprovalRequest(user, approvalToken) {
   const html = renderEmailShell({
     eyebrow: 'Account approval',
     title: 'A new account is waiting for validation',
-    intro: 'A user has created an account in PL Assembly and needs an administrator approval before sign in is allowed.',
+    intro,
     contentHtml: `
       <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
@@ -277,30 +325,43 @@ async function sendAdminApprovalRequest(user, approvalToken) {
     `,
   })
 
-  return sendMail({
+  return sendMailWithNotification({
     to: recipients.join(', '),
     subject: 'New account pending approval',
-    text: [
-      'A new user account is waiting for approval.',
-      '',
-      `Name: ${fullName}`,
-      `Email: ${email}`,
-      '',
-      `Approve this account: ${approvalUrl}`,
-    ].join('\n'),
+    text,
     html,
     attachments: getBrandLogoAttachment(),
+    notification: {
+      type: 'admin-approval-request',
+      subject: 'New account pending approval',
+      title: 'A new account is waiting for validation',
+      message: intro,
+      body: text,
+      action_label: 'Approve this account',
+      action_url: approvalUrl,
+      metadata: {
+        full_name: fullName,
+        email,
+      },
+    },
   })
 }
 
 async function sendUserApprovalConfirmation(user) {
   const fullName = user.full_name || 'User'
   const signInUrl = process.env.FRONTEND_URL ? `${normalizeBaseUrl(process.env.FRONTEND_URL)}/` : ''
+  const intro = 'Good news. Your PL Assembly access has been validated by an administrator.'
+  const text = [
+    `Hello ${fullName},`,
+    '',
+    'Your account has been approved.',
+    'You can now sign in.',
+  ].join('\n')
 
   const html = renderEmailShell({
     eyebrow: 'Account approved',
     title: 'Your account has been approved',
-    intro: 'Good news. Your PL Assembly access has been validated by an administrator.',
+    intro,
     contentHtml: `
       <div style="border-radius:20px;background:#eaf7ef;border:1px solid rgba(29,93,54,0.16);padding:18px;">
         <p style="margin:0;font-size:1rem;line-height:1.6;color:#1d5d36;">
@@ -313,28 +374,42 @@ async function sendUserApprovalConfirmation(user) {
     footerNote: 'If you did not request this account, please contact your administrator.',
   })
 
-  return sendMail({
+  return sendMailWithNotification({
     to: user.email,
     subject: 'Your account has been approved',
-    text: [
-      `Hello ${fullName},`,
-      '',
-      'Your account has been approved.',
-      'You can now sign in.',
-    ].join('\n'),
+    text,
     html,
     attachments: getBrandLogoAttachment(),
+    notification: {
+      type: 'user-approval-confirmation',
+      subject: 'Your account has been approved',
+      title: 'Your account has been approved',
+      message: intro,
+      body: text,
+      action_label: signInUrl ? 'Go to sign in' : '',
+      action_url: signInUrl,
+    },
   })
 }
 
 async function sendUserPasswordResetEmail(user, resetToken) {
   const fullName = user.full_name || 'User'
   const resetUrl = getPasswordResetUrl(resetToken)
+  const intro = 'We received a request to reset your PL Assembly password.'
+  const text = [
+    `Hello ${fullName},`,
+    '',
+    intro,
+    'Use the link below to create a new password:',
+    resetUrl,
+    '',
+    'If you did not request a password reset, you can ignore this email.',
+  ].join('\n')
 
   const html = renderEmailShell({
     eyebrow: 'Password reset',
     title: 'Reset your password',
-    intro: 'We received a request to reset your PL Assembly password.',
+    intro,
     contentHtml: `
       <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px;">
         <p style="margin:0;font-size:1rem;line-height:1.6;color:#162231;">
@@ -353,20 +428,346 @@ async function sendUserPasswordResetEmail(user, resetToken) {
     `,
   })
 
-  return sendMail({
+  return sendMailWithNotification({
     to: user.email,
     subject: 'Reset your password',
-    text: [
-      `Hello ${fullName},`,
-      '',
-      'We received a request to reset your PL Assembly password.',
-      'Use the link below to create a new password:',
-      resetUrl,
-      '',
-      'If you did not request a password reset, you can ignore this email.',
-    ].join('\n'),
+    text,
     html,
     attachments: getBrandLogoAttachment(),
+    notification: {
+      type: 'password-reset',
+      subject: 'Reset your password',
+      title: 'Reset your password',
+      message: intro,
+      body: text,
+      action_label: 'Reset my password',
+      action_url: resetUrl,
+    },
+  })
+}
+
+async function sendSubElementApprovalRequest(approverEmail, pilotName, rfqId, costingId, subElementTitle, approvalToken) {
+  if (!approverEmail || !approverEmail.trim()) {
+    throw new Error('Approver email is required to send approval request.')
+  }
+
+  const safePilotName = getDisplayValue(pilotName, 'Not assigned')
+  const safeRfqId = getDisplayValue(rfqId)
+  const safeCostingId = getDisplayValue(costingId)
+  const safeSubElementTitle = getDisplayValue(subElementTitle, 'Sub-element')
+  const approvalPageUrl = `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/approve-sub-element/${encodeURIComponent(approvalToken)}`
+  const intro = `A pilot has completed the sub-element "${safeSubElementTitle}" and is requesting your approval.`
+  const text = [
+    `A sub-element needs your approval: "${safeSubElementTitle}"`,
+    '',
+    `RFQ ID: ${safeRfqId}`,
+    `Costing ID: ${safeCostingId}`,
+    `Pilot: ${safePilotName}`,
+    '',
+    'Please select one of the following approval statuses:',
+    '- Approved',
+    '- Not approved',
+    '- To be approved',
+    '- Ready for app',
+    '- Need to be reworked',
+    '',
+    'This approval link expires in 7 days.',
+    approvalPageUrl,
+  ].join('\n')
+
+  const html = renderEmailShell({
+    eyebrow: 'Approval request',
+    title: 'Approval needed for RFQ Costing sub-element',
+    intro: `A pilot has completed the sub-element "${escapeHtml(safeSubElementTitle)}" and is requesting your approval.`,
+    contentHtml: `
+      <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+          ${renderDetailRow('RFQ ID', safeRfqId)}
+          ${renderDetailRow('Costing ID', safeCostingId)}
+          ${renderDetailRow('Sub-element', safeSubElementTitle)}
+          ${renderDetailRow('Pilot', safePilotName)}
+        </table>
+      </div>
+      <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
+        Please review and select one of the following approval statuses:
+      </p>
+      <div style="margin:12px 0;padding:12px;background:#f0f4f8;border-left:4px solid #ef7807;border-radius:4px;">
+        <ul style="margin:0;padding-left:20px;font-size:0.96rem;color:#53697b;">
+          <li>Approved</li>
+          <li>Not approved</li>
+          <li>To be approved</li>
+          <li>Ready for app</li>
+          <li>Need to be reworked</li>
+        </ul>
+      </div>
+      <p style="margin:12px 0 0;font-size:0.95rem;line-height:1.6;color:#53697b;">
+        <strong>This approval link expires in 7 days.</strong>
+      </p>
+    `,
+    actionLabel: 'Review & Approve',
+    actionUrl: approvalPageUrl,
+    footerNote: `
+      If the button does not work, copy this link into your browser:<br />
+      <a href="${approvalPageUrl}" style="color:#ef7807;text-decoration:none;font-weight:700;">${approvalPageUrl}</a>
+    `,
+  })
+
+  return sendMailWithNotification({
+    to: approverEmail,
+    subject: 'PL Assembly pending approval',
+    text,
+    html,
+    attachments: getBrandLogoAttachment(),
+    notification: {
+      type: 'sub-element-approval-request',
+      subject: 'PL Assembly pending approval',
+      title: 'Approval needed for RFQ Costing sub-element',
+      message: intro,
+      body: text,
+      action_label: 'Review & Approve',
+      action_url: approvalPageUrl,
+      metadata: {
+        rfq_id: safeRfqId,
+        costing_id: safeCostingId,
+        sub_element_title: safeSubElementTitle,
+        pilot: safePilotName,
+      },
+    },
+  })
+}
+
+async function sendSubElementOpeningNotification(
+  managerEmail,
+  pilotName,
+  rfqId,
+  costingId,
+  subElementTitle,
+) {
+  const safePilotName = getDisplayValue(pilotName, 'Not assigned')
+  const safeRfqId = getDisplayValue(rfqId)
+  const safeCostingId = getDisplayValue(costingId)
+  const safeSubElementTitle = getDisplayValue(subElementTitle, 'A new costing step')
+  const costingPageUrl = getWorkspaceCostingUrl()
+  const intro =
+    'The following step has been triggered after manager approval and is now ready to be completed in PL Assembly.'
+  const text = [
+    `The following step has been triggered after manager approval: "${safeSubElementTitle}"`,
+    '',
+    `RFQ ID: ${safeRfqId}`,
+    `Costing ID: ${safeCostingId}`,
+    `Pilot: ${safePilotName}`,
+    '',
+    'Please open PL Assembly and complete this step.',
+  ].join('\n')
+
+  const html = renderEmailShell({
+    eyebrow: 'Step triggered',
+    title: 'A costing step has been triggered',
+    intro,
+    contentHtml: `
+      <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+          ${renderDetailRow('Triggered step', safeSubElementTitle)}
+          ${renderDetailRow('RFQ ID', safeRfqId)}
+          ${renderDetailRow('Costing ID', safeCostingId)}
+          ${renderDetailRow('Pilot', safePilotName)}
+        </table>
+      </div>
+      <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
+        Please open the application and complete this step.
+      </p>
+    `,
+  })
+
+  return sendMailWithNotification({
+    to: managerEmail,
+    subject: 'PL Assembly step triggered after manager approval',
+    text,
+    html,
+    attachments: getBrandLogoAttachment(),
+    notification: {
+      type: 'sub-element-opened',
+      subject: 'PL Assembly step triggered after manager approval',
+      title: 'A costing step has been triggered',
+      message: intro,
+      body: text,
+      action_label: 'Open workspace',
+      action_url: costingPageUrl,
+      metadata: {
+        rfq_id: safeRfqId,
+        costing_id: safeCostingId,
+        sub_element_title: safeSubElementTitle,
+        pilot: safePilotName,
+      },
+    },
+  })
+}
+
+async function sendPilotAssignmentNotification(
+  pilotEmail,
+  pilotName,
+  subElementTitle,
+  rfqId,
+  costingId,
+) {
+  const safePilotName = getDisplayValue(pilotName, 'Pilot')
+  const safeSubElementTitle = getDisplayValue(subElementTitle, 'a step')
+  const safeRfqId = getDisplayValue(rfqId)
+  const safeCostingId = getDisplayValue(costingId)
+  const costingPageUrl = getWorkspaceCostingUrl()
+  const intro = `Hello ${safePilotName}, you have been assigned to the following step in PL Assembly.`
+  const text = [
+    `Hello ${safePilotName},`,
+    '',
+    `You have been assigned to the following step: "${safeSubElementTitle}"`,
+    '',
+    `RFQ ID: ${safeRfqId}`,
+    `Costing ID: ${safeCostingId}`,
+    '',
+    'Please open PL Assembly and complete this step.',
+  ].join('\n')
+
+  const html = renderEmailShell({
+    eyebrow: 'New assignment',
+    title: 'You have been assigned to a step',
+    intro,
+    contentHtml: `
+      <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+          ${renderDetailRow('Assigned step', safeSubElementTitle)}
+          ${renderDetailRow('RFQ ID', safeRfqId)}
+          ${renderDetailRow('Costing ID', safeCostingId)}
+        </table>
+      </div>
+      <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
+        Please open the application and complete this step.
+      </p>
+    `,
+  })
+
+  return sendMailWithNotification({
+    to: pilotEmail,
+    subject: 'PL Assembly - You have been assigned to a step',
+    text,
+    html,
+    attachments: getBrandLogoAttachment(),
+    notification: {
+      type: 'pilot-assignment',
+      subject: 'PL Assembly - You have been assigned to a step',
+      title: 'You have been assigned to a step',
+      message: intro,
+      body: text,
+      action_label: 'Open workspace',
+      action_url: costingPageUrl,
+      metadata: {
+        rfq_id: safeRfqId,
+        costing_id: safeCostingId,
+        sub_element_title: safeSubElementTitle,
+      },
+    },
+  })
+}
+
+async function sendSubElementStatusNotification(
+  managerEmail,
+  pilotName,
+  rfqId,
+  costingId,
+  subElementTitle,
+  status,
+) {
+  const safePilotName = getDisplayValue(pilotName, 'Not assigned')
+  const safeRfqId = getDisplayValue(rfqId)
+  const safeCostingId = getDisplayValue(costingId)
+  const safeSubElementTitle = getDisplayValue(subElementTitle, 'A costing step')
+  const costingPageUrl = getWorkspaceCostingUrl()
+
+  let eyebrow = 'Status update'
+  let title = 'Step status updated'
+  let intro = ''
+  let statusColor = '#ef7807'
+
+  switch (status) {
+    case 'Help!!!':
+      eyebrow = 'Help needed'
+      title = 'Help needed for a step'
+      intro = `The pilot needs help with the following step. Please review and provide assistance.`
+      statusColor = '#dc2626'
+      break
+    case 'Late!':
+      eyebrow = 'Late step'
+      title = 'Step is late'
+      intro = `The following step has exceeded its due date and is now marked as late. Please take appropriate action.`
+      statusColor = '#dc2626'
+      break
+    case 'Escalation level 1':
+      eyebrow = 'Escalation required'
+      title = 'Step requires escalation'
+      intro = `The following step has been escalated and requires attention. Please review and take action.`
+      statusColor = '#dc2626'
+      break
+    default:
+      eyebrow = 'Status update'
+      title = 'Step status updated'
+      intro = `The following step status has been updated. Please review.`
+  }
+
+  const html = renderEmailShell({
+    eyebrow,
+    title,
+    intro,
+    contentHtml: `
+      <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+          ${renderDetailRow('Step', safeSubElementTitle)}
+          ${renderDetailRow('RFQ ID', safeRfqId)}
+          ${renderDetailRow('Costing ID', safeCostingId)}
+          ${renderDetailRow('Pilot', safePilotName)}
+          ${renderDetailRow('Status', `<span style="color:${statusColor};font-weight:700;">${escapeHtml(status)}</span>`)}
+        </table>
+      </div>
+      <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
+        Please open the application and take appropriate action.
+      </p>
+    `,
+  })
+
+  const text = [
+    `${eyebrow}: ${title}`,
+    '',
+    intro,
+    '',
+    `Step: "${safeSubElementTitle}"`,
+    `RFQ ID: ${safeRfqId}`,
+    `Costing ID: ${safeCostingId}`,
+    `Pilot: ${safePilotName}`,
+    `Status: ${status}`,
+    '',
+    'Please open PL Assembly and take appropriate action.',
+  ].join('\n')
+
+  return sendMailWithNotification({
+    to: managerEmail,
+    subject: `PL Assembly - ${title}`,
+    text,
+    html,
+    attachments: getBrandLogoAttachment(),
+    notification: {
+      type: 'sub-element-status',
+      subject: `PL Assembly - ${title}`,
+      title,
+      message: intro,
+      body: text,
+      action_label: 'Open workspace',
+      action_url: costingPageUrl,
+      metadata: {
+        rfq_id: safeRfqId,
+        costing_id: safeCostingId,
+        sub_element_title: safeSubElementTitle,
+        pilot: safePilotName,
+        status,
+      },
+    },
   })
 }
 
@@ -376,4 +777,8 @@ module.exports = {
   sendAdminApprovalRequest,
   sendUserPasswordResetEmail,
   sendUserApprovalConfirmation,
+  sendSubElementApprovalRequest,
+  sendSubElementOpeningNotification,
+  sendPilotAssignmentNotification,
+  sendSubElementStatusNotification,
 }

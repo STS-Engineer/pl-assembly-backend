@@ -162,6 +162,16 @@ const User = sequelize.define(
       type: DataTypes.DATE,
       allowNull: true,
     },
+    approvable_sub_elements: {
+      type: DataTypes.JSON,
+      allowNull: true,
+      defaultValue: [],
+    },
+    pilot_sub_elements: {
+      type: DataTypes.JSON,
+      allowNull: true,
+      defaultValue: [],
+    },
   },
   {
     tableName: 'users',
