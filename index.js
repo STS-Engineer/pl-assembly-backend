@@ -9,6 +9,7 @@ const Notification = require('./models/notification.model')
 const Rfq = require('./models/rfq.model')
 const RfqCosting = require('./models/rfq-costing.model')
 const RfqCostingInitialSubElement = require('./models/rfq-costing-initial-sub-element.model')
+const SubElementConversationMessage = require('./models/sub-element-conversation-message.model')
 const emailService = require('./emails/email.service')
 const rfqCostingInitialSubElementService = require('./services/rfq-costing-initial-sub-element.service')
 
@@ -50,12 +51,32 @@ RfqCostingInitialSubElement.belongsTo(RfqCosting, {
   as: 'costing',
 })
 
+User.hasMany(SubElementConversationMessage, {
+  foreignKey: 'user_id',
+  as: 'sub_element_conversation_messages',
+})
+
+SubElementConversationMessage.belongsTo(User, {
+  foreignKey: 'user_id',
+  as: 'author',
+})
+
+RfqCosting.hasMany(SubElementConversationMessage, {
+  foreignKey: 'rfq_costing_id',
+  as: 'conversation_messages',
+})
+
+SubElementConversationMessage.belongsTo(RfqCosting, {
+  foreignKey: 'rfq_costing_id',
+  as: 'costing',
+})
+
 const app = express()
 let httpServer = null
 let shutdownHandlersRegistered = false
 
 app.use(cors())
-app.use(express.json({ limit: '1mb' }))
+app.use(express.json({ limit: '16mb' }))
 
 app.use('/api/users', userRoutes)
 app.use('/api/notifications', notificationRoutes)
@@ -114,6 +135,62 @@ app.use((req, res) => {
 })
 
 const PORT = Number(process.env.PORT || 3000)
+
+function normalizeTableName(tableEntry) {
+  if (typeof tableEntry === 'string') {
+    return tableEntry
+  }
+
+  if (tableEntry && typeof tableEntry === 'object') {
+    return tableEntry.tableName || tableEntry.table_name || null
+  }
+
+  return null
+}
+
+function quoteIdentifier(value) {
+  return `"${String(value || '').replace(/"/g, '""')}"`
+}
+
+async function ensureConversationMessageIndexNames() {
+  const queryInterface = sequelize.getQueryInterface()
+  const tableName = SubElementConversationMessage.getTableName()
+  const existingTables = await queryInterface.showAllTables()
+  const normalizedTableNames = new Set(
+    existingTables
+      .map((tableEntry) => normalizeTableName(tableEntry))
+      .filter(Boolean),
+  )
+
+  if (!normalizedTableNames.has(tableName)) {
+    return
+  }
+
+  const existingIndexes = await queryInterface.showIndex(tableName)
+  const existingIndexNames = new Set(
+    existingIndexes
+      .map((indexEntry) => indexEntry?.name)
+      .filter(Boolean),
+  )
+  const indexRenamePairs = [
+    [
+      'sub_element_conversation_messages_rfq_costing_id_sub_element_ke',
+      'idx_secm_costing_step',
+    ],
+    ['sub_element_conversation_messages_user_id', 'idx_secm_user_id'],
+    ['sub_element_conversation_messages_created_at', 'idx_secm_created_at'],
+  ]
+
+  for (const [legacyName, nextName] of indexRenamePairs) {
+    if (!existingIndexNames.has(legacyName) || existingIndexNames.has(nextName)) {
+      continue
+    }
+
+    await sequelize.query(
+      `ALTER INDEX IF EXISTS ${quoteIdentifier(legacyName)} RENAME TO ${quoteIdentifier(nextName)}`,
+    )
+  }
+}
 
 function closeServer() {
   if (!httpServer) {
@@ -177,6 +254,7 @@ async function startServer() {
   await sequelize.authenticate()
   console.log('PostgreSQL connected successfully')
 
+  await ensureConversationMessageIndexNames()
   await sequelize.sync({ alter: true })
   console.log('Models synchronized successfully')
 

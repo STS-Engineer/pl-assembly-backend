@@ -101,6 +101,36 @@ function getDisplayValue(value, fallback = 'N/A') {
   return normalizedValue || fallback
 }
 
+function buildNotificationSummary(parts = []) {
+  return parts
+    .map((part) => String(part ?? '').trim())
+    .filter(Boolean)
+    .join(' | ')
+}
+
+function getOptionalText(value) {
+  const normalizedValue = String(value ?? '').trim()
+  return normalizedValue || null
+}
+
+function normalizeProjectContext(projectContext) {
+  const normalizedProjectContext =
+    projectContext && typeof projectContext === 'object'
+      ? projectContext
+      : { rfq_id: projectContext }
+
+  return {
+    rfq_id: getOptionalText(normalizedProjectContext.rfq_id ?? normalizedProjectContext.rfqId),
+    project_display_name: getDisplayValue(
+      normalizedProjectContext.project_display_name ??
+        normalizedProjectContext.projectDisplayName ??
+        normalizedProjectContext.reference ??
+        normalizedProjectContext.rfq_id ??
+        normalizedProjectContext.rfqId,
+    ),
+  }
+}
+
 function getWorkspaceCostingUrl() {
   return `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/workspace/costing`
 }
@@ -135,22 +165,28 @@ async function sendMailWithNotification({
   html,
   attachments = [],
   notification = null,
+  notificationRecipients = null,
 }) {
-  if (notification) {
-    try {
-      await notificationService.createNotificationsForRecipients(to, notification)
-    } catch (error) {
-      console.error('Unable to create frontend notifications for email recipients:', error.message)
-    }
-  }
-
-  return sendMail({
+  const emailResponse = await sendMail({
     to,
     subject,
     text,
     html,
     attachments,
   })
+
+  if (notification) {
+    try {
+      await notificationService.createNotificationsForRecipients(
+        notificationRecipients || to,
+        notification,
+      )
+    } catch (error) {
+      console.error('Unable to create frontend notifications for email recipients:', error.message)
+    }
+  }
+
+  return emailResponse
 }
 
 function getBrandLogoAttachment() {
@@ -284,11 +320,16 @@ function getPasswordResetUrl(resetToken) {
 
 async function sendAdminApprovalRequest(user, approvalToken) {
   const recipients = resolveAdminRecipients(user.adminEmails)
+  const notificationRecipients =
+    Array.isArray(user.adminNotificationRecipients) && user.adminNotificationRecipients.length > 0
+      ? user.adminNotificationRecipients
+      : recipients
   const approvalUrl = `${normalizeBaseUrl(process.env.BACKEND_URL)}/api/users/approve-account/${encodeURIComponent(approvalToken)}`
   const fullName = user.full_name || 'Unknown user'
   const email = user.email || 'No email provided'
   const intro =
     'A user has created an account in PL Assembly and needs an administrator approval before sign in is allowed.'
+  const notificationMessage = buildNotificationSummary([fullName, email])
   const text = [
     'A new user account is waiting for approval.',
     '',
@@ -331,12 +372,13 @@ async function sendAdminApprovalRequest(user, approvalToken) {
     text,
     html,
     attachments: getBrandLogoAttachment(),
+    notificationRecipients,
     notification: {
       type: 'admin-approval-request',
       subject: 'New account pending approval',
       title: 'A new account is waiting for validation',
-      message: intro,
-      body: text,
+      message: notificationMessage || intro,
+      body: null,
       action_label: 'Approve this account',
       action_url: approvalUrl,
       metadata: {
@@ -351,6 +393,7 @@ async function sendUserApprovalConfirmation(user) {
   const fullName = user.full_name || 'User'
   const signInUrl = process.env.FRONTEND_URL ? `${normalizeBaseUrl(process.env.FRONTEND_URL)}/` : ''
   const intro = 'Good news. Your PL Assembly access has been validated by an administrator.'
+  const notificationMessage = 'You can now sign in.'
   const text = [
     `Hello ${fullName},`,
     '',
@@ -384,8 +427,8 @@ async function sendUserApprovalConfirmation(user) {
       type: 'user-approval-confirmation',
       subject: 'Your account has been approved',
       title: 'Your account has been approved',
-      message: intro,
-      body: text,
+      message: notificationMessage,
+      body: null,
       action_label: signInUrl ? 'Go to sign in' : '',
       action_url: signInUrl,
     },
@@ -396,6 +439,7 @@ async function sendUserPasswordResetEmail(user, resetToken) {
   const fullName = user.full_name || 'User'
   const resetUrl = getPasswordResetUrl(resetToken)
   const intro = 'We received a request to reset your PL Assembly password.'
+  const notificationMessage = 'Use the button below to choose a new password.'
   const text = [
     `Hello ${fullName},`,
     '',
@@ -438,29 +482,41 @@ async function sendUserPasswordResetEmail(user, resetToken) {
       type: 'password-reset',
       subject: 'Reset your password',
       title: 'Reset your password',
-      message: intro,
-      body: text,
+      message: notificationMessage,
+      body: null,
       action_label: 'Reset my password',
       action_url: resetUrl,
     },
   })
 }
 
-async function sendSubElementApprovalRequest(approverEmail, pilotName, rfqId, costingId, subElementTitle, approvalToken) {
+async function sendSubElementApprovalRequest(
+  approverEmail,
+  pilotName,
+  projectContext,
+  costingId,
+  subElementTitle,
+  approvalToken,
+) {
   if (!approverEmail || !approverEmail.trim()) {
     throw new Error('Approver email is required to send approval request.')
   }
 
+  const normalizedProjectContext = normalizeProjectContext(projectContext)
   const safePilotName = getDisplayValue(pilotName, 'Not assigned')
-  const safeRfqId = getDisplayValue(rfqId)
+  const safeProjectDisplayName = normalizedProjectContext.project_display_name
   const safeCostingId = getDisplayValue(costingId)
   const safeSubElementTitle = getDisplayValue(subElementTitle, 'Sub-element')
   const approvalPageUrl = `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/approve-sub-element/${encodeURIComponent(approvalToken)}`
   const intro = `A pilot has completed the sub-element "${safeSubElementTitle}" and is requesting your approval.`
+  const notificationMessage = buildNotificationSummary([
+    safeProjectDisplayName,
+    safeSubElementTitle,
+  ])
   const text = [
     `A sub-element needs your approval: "${safeSubElementTitle}"`,
     '',
-    `RFQ ID: ${safeRfqId}`,
+    `Project: ${safeProjectDisplayName}`,
     `Costing ID: ${safeCostingId}`,
     `Pilot: ${safePilotName}`,
     '',
@@ -482,7 +538,7 @@ async function sendSubElementApprovalRequest(approverEmail, pilotName, rfqId, co
     contentHtml: `
       <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
-          ${renderDetailRow('RFQ ID', safeRfqId)}
+          ${renderDetailRow('Project', safeProjectDisplayName)}
           ${renderDetailRow('Costing ID', safeCostingId)}
           ${renderDetailRow('Sub-element', safeSubElementTitle)}
           ${renderDetailRow('Pilot', safePilotName)}
@@ -522,12 +578,13 @@ async function sendSubElementApprovalRequest(approverEmail, pilotName, rfqId, co
       type: 'sub-element-approval-request',
       subject: 'PL Assembly pending approval',
       title: 'Approval needed for RFQ Costing sub-element',
-      message: intro,
-      body: text,
+      message: notificationMessage || intro,
+      body: null,
       action_label: 'Review & Approve',
       action_url: approvalPageUrl,
       metadata: {
-        rfq_id: safeRfqId,
+        rfq_id: normalizedProjectContext.rfq_id,
+        project_display_name: safeProjectDisplayName,
         costing_id: safeCostingId,
         sub_element_title: safeSubElementTitle,
         pilot: safePilotName,
@@ -539,21 +596,26 @@ async function sendSubElementApprovalRequest(approverEmail, pilotName, rfqId, co
 async function sendSubElementOpeningNotification(
   managerEmail,
   pilotName,
-  rfqId,
+  projectContext,
   costingId,
   subElementTitle,
 ) {
+  const normalizedProjectContext = normalizeProjectContext(projectContext)
   const safePilotName = getDisplayValue(pilotName, 'Not assigned')
-  const safeRfqId = getDisplayValue(rfqId)
+  const safeProjectDisplayName = normalizedProjectContext.project_display_name
   const safeCostingId = getDisplayValue(costingId)
   const safeSubElementTitle = getDisplayValue(subElementTitle, 'A new costing step')
   const costingPageUrl = getWorkspaceCostingUrl()
   const intro =
     'The following step has been triggered after manager approval and is now ready to be completed in PL Assembly.'
+  const notificationMessage = buildNotificationSummary([
+    safeProjectDisplayName,
+    safeSubElementTitle,
+  ])
   const text = [
     `The following step has been triggered after manager approval: "${safeSubElementTitle}"`,
     '',
-    `RFQ ID: ${safeRfqId}`,
+    `Project: ${safeProjectDisplayName}`,
     `Costing ID: ${safeCostingId}`,
     `Pilot: ${safePilotName}`,
     '',
@@ -568,7 +630,7 @@ async function sendSubElementOpeningNotification(
       <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
           ${renderDetailRow('Triggered step', safeSubElementTitle)}
-          ${renderDetailRow('RFQ ID', safeRfqId)}
+          ${renderDetailRow('Project', safeProjectDisplayName)}
           ${renderDetailRow('Costing ID', safeCostingId)}
           ${renderDetailRow('Pilot', safePilotName)}
         </table>
@@ -589,12 +651,13 @@ async function sendSubElementOpeningNotification(
       type: 'sub-element-opened',
       subject: 'PL Assembly step triggered after manager approval',
       title: 'A costing step has been triggered',
-      message: intro,
-      body: text,
+      message: notificationMessage || intro,
+      body: null,
       action_label: 'Open workspace',
       action_url: costingPageUrl,
       metadata: {
-        rfq_id: safeRfqId,
+        rfq_id: normalizedProjectContext.rfq_id,
+        project_display_name: safeProjectDisplayName,
         costing_id: safeCostingId,
         sub_element_title: safeSubElementTitle,
         pilot: safePilotName,
@@ -607,21 +670,26 @@ async function sendPilotAssignmentNotification(
   pilotEmail,
   pilotName,
   subElementTitle,
-  rfqId,
+  projectContext,
   costingId,
 ) {
+  const normalizedProjectContext = normalizeProjectContext(projectContext)
   const safePilotName = getDisplayValue(pilotName, 'Pilot')
   const safeSubElementTitle = getDisplayValue(subElementTitle, 'a step')
-  const safeRfqId = getDisplayValue(rfqId)
+  const safeProjectDisplayName = normalizedProjectContext.project_display_name
   const safeCostingId = getDisplayValue(costingId)
   const costingPageUrl = getWorkspaceCostingUrl()
   const intro = `Hello ${safePilotName}, you have been assigned to the following step in PL Assembly.`
+  const notificationMessage = buildNotificationSummary([
+    safeProjectDisplayName,
+    safeSubElementTitle,
+  ])
   const text = [
     `Hello ${safePilotName},`,
     '',
     `You have been assigned to the following step: "${safeSubElementTitle}"`,
     '',
-    `RFQ ID: ${safeRfqId}`,
+    `Project: ${safeProjectDisplayName}`,
     `Costing ID: ${safeCostingId}`,
     '',
     'Please open PL Assembly and complete this step.',
@@ -635,7 +703,7 @@ async function sendPilotAssignmentNotification(
       <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
           ${renderDetailRow('Assigned step', safeSubElementTitle)}
-          ${renderDetailRow('RFQ ID', safeRfqId)}
+          ${renderDetailRow('Project', safeProjectDisplayName)}
           ${renderDetailRow('Costing ID', safeCostingId)}
         </table>
       </div>
@@ -655,12 +723,13 @@ async function sendPilotAssignmentNotification(
       type: 'pilot-assignment',
       subject: 'PL Assembly - You have been assigned to a step',
       title: 'You have been assigned to a step',
-      message: intro,
-      body: text,
+      message: notificationMessage || intro,
+      body: null,
       action_label: 'Open workspace',
       action_url: costingPageUrl,
       metadata: {
-        rfq_id: safeRfqId,
+        rfq_id: normalizedProjectContext.rfq_id,
+        project_display_name: safeProjectDisplayName,
         costing_id: safeCostingId,
         sub_element_title: safeSubElementTitle,
       },
@@ -671,16 +740,22 @@ async function sendPilotAssignmentNotification(
 async function sendSubElementStatusNotification(
   managerEmail,
   pilotName,
-  rfqId,
+  projectContext,
   costingId,
   subElementTitle,
   status,
 ) {
+  const normalizedProjectContext = normalizeProjectContext(projectContext)
   const safePilotName = getDisplayValue(pilotName, 'Not assigned')
-  const safeRfqId = getDisplayValue(rfqId)
+  const safeProjectDisplayName = normalizedProjectContext.project_display_name
   const safeCostingId = getDisplayValue(costingId)
   const safeSubElementTitle = getDisplayValue(subElementTitle, 'A costing step')
   const costingPageUrl = getWorkspaceCostingUrl()
+  const notificationMessage = buildNotificationSummary([
+    safeProjectDisplayName,
+    safeSubElementTitle,
+    status,
+  ])
 
   let eyebrow = 'Status update'
   let title = 'Step status updated'
@@ -720,7 +795,7 @@ async function sendSubElementStatusNotification(
       <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
           ${renderDetailRow('Step', safeSubElementTitle)}
-          ${renderDetailRow('RFQ ID', safeRfqId)}
+          ${renderDetailRow('Project', safeProjectDisplayName)}
           ${renderDetailRow('Costing ID', safeCostingId)}
           ${renderDetailRow('Pilot', safePilotName)}
           ${renderDetailRow('Status', `<span style="color:${statusColor};font-weight:700;">${escapeHtml(status)}</span>`)}
@@ -738,7 +813,7 @@ async function sendSubElementStatusNotification(
     intro,
     '',
     `Step: "${safeSubElementTitle}"`,
-    `RFQ ID: ${safeRfqId}`,
+    `Project: ${safeProjectDisplayName}`,
     `Costing ID: ${safeCostingId}`,
     `Pilot: ${safePilotName}`,
     `Status: ${status}`,
@@ -756,12 +831,13 @@ async function sendSubElementStatusNotification(
       type: 'sub-element-status',
       subject: `PL Assembly - ${title}`,
       title,
-      message: intro,
-      body: text,
+      message: notificationMessage || intro,
+      body: null,
       action_label: 'Open workspace',
       action_url: costingPageUrl,
       metadata: {
-        rfq_id: safeRfqId,
+        rfq_id: normalizedProjectContext.rfq_id,
+        project_display_name: safeProjectDisplayName,
         costing_id: safeCostingId,
         sub_element_title: safeSubElementTitle,
         pilot: safePilotName,

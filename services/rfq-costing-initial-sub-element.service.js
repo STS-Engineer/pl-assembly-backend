@@ -4,6 +4,7 @@ const RfqCosting = require('../models/rfq-costing.model')
 const RfqCostingInitialSubElement = require('../models/rfq-costing-initial-sub-element.model')
 const emailService = require('../emails/email.service')
 const User = require('../models/user.model')
+const { getCostingDisplayData } = require('./rfq-display.service')
 
 const STATUS_ALIASES = {
   'to be plannd': 'To be planned',
@@ -317,7 +318,13 @@ function buildPermissions(template, currentRole) {
   }
 }
 
-async function serializeSubElement(subElement, template, currentRole, approversByKey = null) {
+async function serializeSubElement(
+  subElement,
+  template,
+  currentRole,
+  approversByKey = null,
+  costingDisplayData = null,
+) {
   const rawSubElement =
     subElement && typeof subElement.toJSON === 'function' ? subElement.toJSON() : subElement || {}
 
@@ -338,6 +345,9 @@ async function serializeSubElement(subElement, template, currentRole, approversB
     duration: rawSubElement.duration,
     due_date: rawSubElement.due_date,
     design_type: rawSubElement.design_type,
+    rfq_id: costingDisplayData?.rfq_id || null,
+    project_display_name: costingDisplayData?.project_display_name || null,
+    projectDisplayName: costingDisplayData?.project_display_name || null,
     managers: managers.map(m => ({
       id: m.id,
       email: m.email,
@@ -551,6 +561,7 @@ async function triggerWorkflowAfterApproval(costing, sourceItem) {
 
 async function notifyManagersThatSubElementWasTriggered(costing, sourceItem, subElement) {
   const managers = await findApproversBySubElementKey(subElement.key)
+  const costingDisplayData = await getCostingDisplayData(costing)
   const pilotName = subElement.pilot || sourceItem.pilot || 'Not assigned'
 
   let successCount = 0
@@ -568,7 +579,7 @@ async function notifyManagersThatSubElementWasTriggered(costing, sourceItem, sub
       await emailService.sendSubElementOpeningNotification(
         manager.email,
         pilotName,
-        costing.rfq_id || 'N/A',
+        costingDisplayData,
         costing.id || 'N/A',
         subElement.title,
       )
@@ -634,17 +645,21 @@ async function getSubElementsByCostingIds(costingIds, context = {}) {
 
   const currentRole = getRequestedRole(context)
 
-  const [costingEntries, approversByKey, metadata] = await Promise.all([
+  const [costingEntries, costingDisplayEntries, approversByKey, metadata] = await Promise.all([
     Promise.all(
       costings.map(async (costing) => [
         String(costing.id),
         await ensureDefaultSubElements(costing.id),
       ]),
     ),
+    Promise.all(
+      costings.map(async (costing) => [String(costing.id), await getCostingDisplayData(costing)]),
+    ),
     getApproversBySubElementKeyMap(),
     getOptions(),
   ])
   const itemsByCostingId = new Map(costingEntries)
+  const costingDisplayDataById = new Map(costingDisplayEntries)
 
   const serializedEntries = await Promise.all(
     costings.map(async (costing) => {
@@ -653,7 +668,13 @@ async function getSubElementsByCostingIds(costingIds, context = {}) {
       const serializedItems = await Promise.all(
         costingItems.map(async (item) => {
           const template = getTemplateByKey(item.key)
-          return serializeSubElement(item, template, currentRole, approversByKey)
+          return serializeSubElement(
+            item,
+            template,
+            currentRole,
+            approversByKey,
+            costingDisplayDataById.get(costingKey) || null,
+          )
         }),
       )
 
@@ -669,6 +690,7 @@ async function getSubElementsByCostingIds(costingIds, context = {}) {
 
 async function getSubElementsByCostingId(costingId, context = {}) {
   const costing = await getInitialCosting(costingId)
+  const costingDisplayData = await getCostingDisplayData(costing)
   const currentRole = getRequestedRole(context)
   const [items, approversByKey] = await Promise.all([
     ensureDefaultSubElements(costing.id),
@@ -678,11 +700,18 @@ async function getSubElementsByCostingId(costingId, context = {}) {
   return {
     costing_id: costing.id,
     rfq_id: costing.rfq_id,
+    project_display_name: costingDisplayData.project_display_name,
     costing_type: costing.type,
     items: await Promise.all(
       items.map(async (item) => {
         const template = getTemplateByKey(item.key)
-        return await serializeSubElement(item, template, currentRole, approversByKey)
+        return await serializeSubElement(
+          item,
+          template,
+          currentRole,
+          approversByKey,
+          costingDisplayData,
+        )
       })
     ),
     metadata: await getOptions(),
@@ -691,6 +720,7 @@ async function getSubElementsByCostingId(costingId, context = {}) {
 
 async function getSubElementByKey(costingId, key, context = {}) {
   const costing = await getInitialCosting(costingId)
+  const costingDisplayData = await getCostingDisplayData(costing)
   await ensureDefaultSubElements(costing.id)
 
   const template = getTemplateByKey(key)
@@ -716,12 +746,14 @@ async function getSubElementByKey(costingId, key, context = {}) {
   return {
     costing_id: costing.id,
     rfq_id: costing.rfq_id,
+    project_display_name: costingDisplayData.project_display_name,
     costing_type: costing.type,
     sub_element: await serializeSubElement(
       item,
       template,
       currentRole,
       await getApproversBySubElementKeyMap(),
+      costingDisplayData,
     ),
     metadata: buildSubElementDefinition(template),
   }
@@ -729,6 +761,7 @@ async function getSubElementByKey(costingId, key, context = {}) {
 
 async function updateSubElementByKey(costingId, key, payload = {}) {
   const costing = await getInitialCosting(costingId)
+  const costingDisplayData = await getCostingDisplayData(costing)
   await ensureDefaultSubElements(costing.id)
 
   const template = getTemplateByKey(key)
@@ -843,7 +876,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
             resolvedPilotUser.email,
             resolvedPilotUser.full_name || updateData.pilot,
             template.title,
-            costing.rfq_id,
+            costingDisplayData,
             costing.id,
           )
         } else {
@@ -884,7 +917,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
                 await emailService.sendSubElementApprovalRequest(
                   approver.email,
                   item.pilot,
-                  costing.rfq_id,
+                  costingDisplayData,
                   costing.id,
                   template.title,
                   approvalToken
@@ -910,7 +943,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
                 await emailService.sendSubElementStatusNotification(
                   approver.email,
                   item.pilot,
-                  costing.rfq_id,
+                  costingDisplayData,
                   costing.id,
                   template.title,
                   updateData.status,
@@ -1107,6 +1140,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
 
   if (false && key === 'needed-data-understood' && updateData.status === 'Done') {
     const designType = updateData.design_type || item.design_type
+    const costingDisplayData = await getCostingDisplayData(costing)
 
     ;(async () => {
       try {
@@ -1131,7 +1165,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
                 await emailService.sendSubElementOpeningNotification(
                   manager.email,
                   pilotName,
-                  costing.rfq_id || 'N/A',
+                  costingDisplayData,
                   costing.id || 'N/A',
                   'AVO Design owner : assembly 2D is available for customer communication',
                 )
@@ -1161,7 +1195,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
                 await emailService.sendSubElementOpeningNotification(
                   manager.email,
                   pilotName,
-                  costing.rfq_id || 'N/A',
+                  costingDisplayData,
                   costing.id || 'N/A',
                   'Technical feasibility assessment is available for customer communication',
                 )
@@ -1177,7 +1211,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
                 await emailService.sendSubElementOpeningNotification(
                   manager.email,
                   pilotName,
-                  costing.rfq_id || 'N/A',
+                  costingDisplayData,
                   costing.id || 'N/A',
                   'BoM and spec are correctly completed inside the costing file',
                 )
@@ -1195,12 +1229,14 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     message: 'Initial Costing sub-element updated successfully.',
     costing_id: costing.id,
     rfq_id: costing.rfq_id,
+    project_display_name: costingDisplayData.project_display_name,
     costing_type: costing.type,
     sub_element: await serializeSubElement(
       item,
       template,
       currentRole,
       await getApproversBySubElementKeyMap(),
+      costingDisplayData,
     ),
     metadata: buildSubElementDefinition(template),
   }
@@ -1237,9 +1273,12 @@ async function getSubElementByApprovalToken(token, context = {}) {
     throw createHttpError(404, 'Sub-element template not found.')
   }
 
+  const costingDisplayData = await getCostingDisplayData(costing)
+
   return {
     costing_id: costing.id,
     rfq_id: costing.rfq_id,
+    project_display_name: costingDisplayData.project_display_name,
     costing_type: costing.type,
     sub_element: {
       id: item.id,
@@ -1253,6 +1292,9 @@ async function getSubElementByApprovalToken(token, context = {}) {
       duration: item.duration,
       due_date: item.due_date,
       design_type: item.design_type,
+      rfq_id: costingDisplayData.rfq_id,
+      project_display_name: costingDisplayData.project_display_name,
+      projectDisplayName: costingDisplayData.project_display_name,
     },
     metadata: buildSubElementDefinition(template),
   }
@@ -1284,6 +1326,8 @@ async function approveSubElementByToken(token, payload = {}) {
   }
 
   const template = getTemplateByKey(item.key)
+
+  const costingDisplayData = await getCostingDisplayData(costing)
 
   if (!template) {
     throw createHttpError(404, 'Sub-element template not found.')
@@ -1344,6 +1388,7 @@ async function approveSubElementByToken(token, payload = {}) {
     message: 'Sub-element approved successfully.',
     costing_id: costing.id,
     rfq_id: costing.rfq_id,
+    project_display_name: costingDisplayData.project_display_name,
     costing_type: costing.type,
     sub_element: {
       id: item.id,
@@ -1357,6 +1402,9 @@ async function approveSubElementByToken(token, payload = {}) {
       duration: item.duration,
       due_date: item.due_date,
       design_type: item.design_type,
+      rfq_id: costingDisplayData.rfq_id,
+      project_display_name: costingDisplayData.project_display_name,
+      projectDisplayName: costingDisplayData.project_display_name,
     },
     metadata: buildSubElementDefinition(template),
   }

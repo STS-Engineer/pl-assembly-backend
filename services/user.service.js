@@ -229,6 +229,7 @@ async function signUp(payload) {
       {
         ...user,
         adminEmails: notificationRecipients,
+        adminNotificationRecipients: approvedAdmins,
       },
       approvalToken
     )

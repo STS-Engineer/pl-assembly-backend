@@ -1,4 +1,6 @@
 const rfqCostingInitialSubElementService = require('../services/rfq-costing-initial-sub-element.service')
+const subElementConversationService = require('../services/sub-element-conversation.service')
+const userService = require('../services/user.service')
 
 function handleControllerError(res, error) {
   const statusCode = error.statusCode || 500
@@ -7,6 +9,10 @@ function handleControllerError(res, error) {
   res.status(statusCode).json({
     message,
   })
+}
+
+async function getAuthenticatedUser(req) {
+  return userService.authenticateAccessTokenFromHeader(req.headers.authorization)
 }
 
 async function getOptions(req, res) {
@@ -101,6 +107,48 @@ async function approveSubElementByToken(req, res) {
   }
 }
 
+async function getSubElementConversation(req, res) {
+  try {
+    console.log('[getSubElementConversation] Request:', {
+      costingId: req.params.costingId,
+      key: req.params.key,
+      headers: req.headers,
+    })
+
+    const authenticatedUser = await getAuthenticatedUser(req)
+    const result = await subElementConversationService.getConversation(
+      req.params.costingId,
+      req.params.key,
+      authenticatedUser,
+    )
+    res.status(200).json(result)
+  } catch (error) {
+    console.error('[getSubElementConversation] Error:', {
+      message: error.message,
+      statusCode: error.statusCode,
+      costingId: req.params.costingId,
+      key: req.params.key,
+      stack: error.stack,
+    })
+    handleControllerError(res, error)
+  }
+}
+
+async function createSubElementConversationMessage(req, res) {
+  try {
+    const authenticatedUser = await getAuthenticatedUser(req)
+    const result = await subElementConversationService.createConversationMessage(
+      req.params.costingId,
+      req.params.key,
+      req.body,
+      authenticatedUser,
+    )
+    res.status(201).json(result)
+  } catch (error) {
+    handleControllerError(res, error)
+  }
+}
+
 module.exports = {
   getOptions,
   getSubElementsByCostingIds,
@@ -109,4 +157,6 @@ module.exports = {
   updateSubElementByKey,
   getSubElementByApprovalToken,
   approveSubElementByToken,
+  getSubElementConversation,
+  createSubElementConversationMessage,
 }
