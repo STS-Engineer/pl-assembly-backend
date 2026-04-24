@@ -4,7 +4,7 @@ const RfqCosting = require('../models/rfq-costing.model')
 const RfqCostingInitialSubElement = require('../models/rfq-costing-initial-sub-element.model')
 const emailService = require('../emails/email.service')
 const User = require('../models/user.model')
-const { getCostingDisplayData } = require('./rfq-display.service')
+const { getCostingDisplayData, getCostingDisplayDataMap } = require('./rfq-display.service')
 
 const STATUS_ALIASES = {
   'to be plannd': 'To be planned',
@@ -394,16 +394,114 @@ async function ensureSubElementForCosting(costingId, template) {
 }
 
 async function ensureDefaultSubElements(costingId) {
-  const items = await Promise.all(
-    RfqCostingInitialSubElement.TEMPLATES.map((template) =>
-      ensureSubElementForCosting(costingId, template),
+  const itemsByCostingId = await ensureDefaultSubElementsByCostingIds([costingId])
+  return itemsByCostingId.get(String(costingId)) || []
+}
+
+async function ensureDefaultSubElementsByCostingIds(costingIds = []) {
+  const normalizedCostingIds = Array.from(
+    new Set(
+      (Array.isArray(costingIds) ? costingIds : [])
+        .map((costingId) => Number.parseInt(String(costingId || '').trim(), 10))
+        .filter((costingId) => Number.isInteger(costingId) && costingId > 0),
     ),
   )
-  const itemsByKey = new Map(items.map((item) => [item.key, item]))
 
-  return RfqCostingInitialSubElement.TEMPLATES.map((template) => itemsByKey.get(template.key)).filter(
-    Boolean,
-  )
+  if (normalizedCostingIds.length === 0) {
+    return new Map()
+  }
+
+  const templates = RfqCostingInitialSubElement.TEMPLATES
+  const templateKeys = templates.map((template) => template.key)
+  const templateOrderLookup = getTemplateOrderLookup()
+
+  const existingItems = await RfqCostingInitialSubElement.findAll({
+    where: {
+      rfq_costing_id: normalizedCostingIds,
+      key: templateKeys,
+    },
+  })
+
+  const existingItemsByCompositeKey = existingItems.reduce((lookup, item) => {
+    lookup.set(`${item.rfq_costing_id}:${item.key}`, item)
+    return lookup
+  }, new Map())
+
+  const itemsToCreate = []
+  const titleUpdateOperations = []
+
+  normalizedCostingIds.forEach((costingId) => {
+    templates.forEach((template) => {
+      const compositeKey = `${costingId}:${template.key}`
+      const existingItem = existingItemsByCompositeKey.get(compositeKey)
+
+      if (!existingItem) {
+        itemsToCreate.push({
+          rfq_costing_id: costingId,
+          key: template.key,
+          title: template.title,
+          status: template.defaultStatus,
+          approval_status: template.defaultApprovalStatus,
+        })
+        return
+      }
+
+      if (existingItem.title !== template.title) {
+        titleUpdateOperations.push(existingItem.update({ title: template.title }))
+      }
+    })
+  })
+
+  if (itemsToCreate.length > 0) {
+    await RfqCostingInitialSubElement.bulkCreate(itemsToCreate, {
+      ignoreDuplicates: true,
+    })
+  }
+
+  if (titleUpdateOperations.length > 0) {
+    await Promise.all(titleUpdateOperations)
+  }
+
+  const finalItems =
+    itemsToCreate.length > 0 || titleUpdateOperations.length > 0
+      ? await RfqCostingInitialSubElement.findAll({
+          where: {
+            rfq_costing_id: normalizedCostingIds,
+            key: templateKeys,
+          },
+        })
+      : existingItems
+
+  const itemsByCostingId = normalizedCostingIds.reduce((lookup, costingId) => {
+    lookup.set(String(costingId), [])
+    return lookup
+  }, new Map())
+
+  finalItems.forEach((item) => {
+    const costingKey = String(item.rfq_costing_id)
+
+    if (!itemsByCostingId.has(costingKey)) {
+      itemsByCostingId.set(costingKey, [])
+    }
+
+    itemsByCostingId.get(costingKey).push(item)
+  })
+
+  itemsByCostingId.forEach((items, costingKey) => {
+    const itemsByKey = new Map(items.map((item) => [item.key, item]))
+    const orderedItems = templates
+      .map((template) => itemsByKey.get(template.key))
+      .filter(Boolean)
+      .sort((leftItem, rightItem) => {
+        const leftOrder = templateOrderLookup.get(leftItem.key) ?? Number.MAX_SAFE_INTEGER
+        const rightOrder = templateOrderLookup.get(rightItem.key) ?? Number.MAX_SAFE_INTEGER
+        return leftOrder - rightOrder
+      })
+
+    itemsByCostingId.set(costingKey, orderedItems)
+  })
+
+  return itemsByCostingId
 }
 
 function getTriggeredSubElementKeys(designType) {
@@ -428,6 +526,13 @@ function getSubElementKeysAfterTechnicalFeasibilityAndBomSpec() {
 
 function getSubElementKeyAfterBomCostAndAssemblyCost() {
   return ['costing-file-reviewed']
+}
+
+function getTemplateOrderLookup() {
+  return RfqCostingInitialSubElement.TEMPLATES.reduce((lookup, template, index) => {
+    lookup.set(template.key, index)
+    return lookup
+  }, new Map())
 }
 
 async function updateLateStatuses() {
@@ -560,6 +665,7 @@ async function triggerWorkflowAfterApproval(costing, sourceItem) {
 }
 
 async function notifyManagersThatSubElementWasTriggered(costing, sourceItem, subElement) {
+  return
   const managers = await findApproversBySubElementKey(subElement.key)
   const costingDisplayData = await getCostingDisplayData(costing)
   const pilotName = subElement.pilot || sourceItem.pilot || 'Not assigned'
@@ -645,21 +751,12 @@ async function getSubElementsByCostingIds(costingIds, context = {}) {
 
   const currentRole = getRequestedRole(context)
 
-  const [costingEntries, costingDisplayEntries, approversByKey, metadata] = await Promise.all([
-    Promise.all(
-      costings.map(async (costing) => [
-        String(costing.id),
-        await ensureDefaultSubElements(costing.id),
-      ]),
-    ),
-    Promise.all(
-      costings.map(async (costing) => [String(costing.id), await getCostingDisplayData(costing)]),
-    ),
+  const [itemsByCostingId, costingDisplayDataById, approversByKey, metadata] = await Promise.all([
+    ensureDefaultSubElementsByCostingIds(costings.map((costing) => costing.id)),
+    getCostingDisplayDataMap(costings),
     getApproversBySubElementKeyMap(),
     getOptions(),
   ])
-  const itemsByCostingId = new Map(costingEntries)
-  const costingDisplayDataById = new Map(costingDisplayEntries)
 
   const serializedEntries = await Promise.all(
     costings.map(async (costing) => {

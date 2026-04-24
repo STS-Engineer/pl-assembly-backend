@@ -22,6 +22,21 @@ function getTrimmedText(value) {
   return String(value || '').trim()
 }
 
+function normalizeRfqData(rfqId, value) {
+  const rawValue = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  const normalizedEntries = Object.entries(rawValue).map(([key, entryValue]) => [
+    key,
+    typeof entryValue === 'string' ? entryValue.trim() : entryValue,
+  ])
+  const normalizedData = Object.fromEntries(normalizedEntries)
+  const normalizedReference = getTrimmedText(normalizedData.systematic_rfq_id) || rfqId
+
+  return {
+    ...normalizedData,
+    systematic_rfq_id: normalizedReference,
+  }
+}
+
 function serializeRfqCosting(costing) {
   const rawCosting =
     costing && typeof costing.toJSON === 'function' ? costing.toJSON() : costing || {}
@@ -65,6 +80,30 @@ async function getAllRfqs() {
   })
 
   return rfqs.map(serializeRfq)
+}
+
+async function createRfq(payload) {
+  const normalizedRfqId = getTrimmedText(payload?.rfq_id)
+
+  if (!normalizedRfqId) {
+    throw createHttpError(400, 'RFQ identifier is required.')
+  }
+
+  const existingRfq = await Rfq.findByPk(normalizedRfqId)
+
+  if (existingRfq) {
+    throw createHttpError(409, 'RFQ already exists.')
+  }
+
+  const rfq = await Rfq.create({
+    rfq_id: normalizedRfqId,
+    rfq_data: normalizeRfqData(normalizedRfqId, payload?.rfq_data),
+  })
+
+  return serializeRfq({
+    ...rfq.toJSON(),
+    costings: [],
+  })
 }
 
 async function createRfqCosting(rfqId, payload) {
@@ -113,5 +152,6 @@ async function createRfqCosting(rfqId, payload) {
 
 module.exports = {
   getAllRfqs,
+  createRfq,
   createRfqCosting,
 }

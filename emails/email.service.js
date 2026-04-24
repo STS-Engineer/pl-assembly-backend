@@ -593,7 +593,7 @@ async function sendSubElementApprovalRequest(
   })
 }
 
-async function sendSubElementOpeningNotification(
+/*async function sendSubElementOpeningNotification(
   managerEmail,
   pilotName,
   projectContext,
@@ -664,7 +664,7 @@ async function sendSubElementOpeningNotification(
       },
     },
   })
-}
+}*/
 
 async function sendPilotAssignmentNotification(
   pilotEmail,
@@ -854,7 +854,6 @@ module.exports = {
   sendUserPasswordResetEmail,
   sendUserApprovalConfirmation,
   sendSubElementApprovalRequest,
-  sendSubElementOpeningNotification,
   sendPilotAssignmentNotification,
   sendSubElementStatusNotification,
 }

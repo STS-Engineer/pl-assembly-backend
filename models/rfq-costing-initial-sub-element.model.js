@@ -25,7 +25,6 @@ const INITIAL_SUB_ELEMENT_APPROVAL_STATUS_VALUES = [
 ]
 
 const INITIAL_SUB_ELEMENT_ROLE_VALUES = ['pilot', 'manager', 'admin', 'pm', 'sales', 'pl', 'user']
-
 const INITIAL_SUB_ELEMENT_DESIGN_TYPE_VALUES = ['Customer Design', 'AVO Design']
 
 const INITIAL_SUB_ELEMENT_TEMPLATES = [

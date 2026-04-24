@@ -61,6 +61,46 @@ async function getRfqDisplayDataById(rfqId) {
   return extractRfqDisplayData(rfq)
 }
 
+async function getRfqDisplayDataMapByIds(rfqIds = []) {
+  const normalizedRfqIds = Array.from(
+    new Set(
+      (Array.isArray(rfqIds) ? rfqIds : [])
+        .map((rfqId) => getOptionalText(rfqId))
+        .filter(Boolean),
+    ),
+  )
+
+  if (normalizedRfqIds.length === 0) {
+    return new Map()
+  }
+
+  const rfqs = await Rfq.findAll({
+    where: {
+      rfq_id: normalizedRfqIds,
+    },
+    attributes: ['rfq_id', 'rfq_data'],
+  })
+
+  const displayDataById = rfqs.reduce((lookup, rfq) => {
+    const displayData = extractRfqDisplayData(rfq)
+    const rfqId = getOptionalText(displayData.rfq_id)
+
+    if (rfqId) {
+      lookup.set(rfqId, displayData)
+    }
+
+    return lookup
+  }, new Map())
+
+  normalizedRfqIds.forEach((rfqId) => {
+    if (!displayDataById.has(rfqId)) {
+      displayDataById.set(rfqId, extractRfqDisplayData({ rfq_id: rfqId }))
+    }
+  })
+
+  return displayDataById
+}
+
 async function getCostingDisplayData(costing = {}) {
   const rawCosting =
     costing && typeof costing.toJSON === 'function' ? costing.toJSON() : costing || {}
@@ -74,9 +114,40 @@ async function getCostingDisplayData(costing = {}) {
   }
 }
 
+async function getCostingDisplayDataMap(costings = []) {
+  const rawCostings = (Array.isArray(costings) ? costings : []).map((costing) =>
+    costing && typeof costing.toJSON === 'function' ? costing.toJSON() : costing || {},
+  )
+
+  const rfqDisplayDataById = await getRfqDisplayDataMapByIds(
+    rawCostings.map((costing) => costing.rfq_id),
+  )
+
+  return rawCostings.reduce((lookup, rawCosting) => {
+    const costingId =
+      rawCosting.id === undefined || rawCosting.id === null ? null : String(rawCosting.id)
+    const normalizedRfqId = getOptionalText(rawCosting.rfq_id)
+    const rfqDisplayData = normalizedRfqId
+      ? rfqDisplayDataById.get(normalizedRfqId) || extractRfqDisplayData({ rfq_id: normalizedRfqId })
+      : extractRfqDisplayData({})
+
+    if (costingId) {
+      lookup.set(costingId, {
+        ...rfqDisplayData,
+        costing_id: rawCosting.id ?? null,
+        costing_type: rawCosting.type ?? null,
+      })
+    }
+
+    return lookup
+  }, new Map())
+}
+
 module.exports = {
   buildProjectDisplayName,
   extractRfqDisplayData,
   getRfqDisplayDataById,
   getCostingDisplayData,
+  getRfqDisplayDataMapByIds,
+  getCostingDisplayDataMap,
 }

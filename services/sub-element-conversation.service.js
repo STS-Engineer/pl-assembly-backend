@@ -13,6 +13,16 @@ const MAX_TOTAL_ATTACHMENT_BYTES = 10 * 1024 * 1024
 const MAX_FILENAME_LENGTH = 180
 const DATA_URL_REGEX = /^data:([^;,]+);base64,([a-z0-9+/=\s]+)$/i
 const FRONTEND_DEFAULT_PORT = process.env.PORT || 3000
+const CONVERSATION_CACHE_TTL_MS = Math.max(
+  Number.parseInt(String(process.env.CONVERSATION_CACHE_TTL_MS || '5000').trim(), 10) || 5000,
+  1000,
+)
+const CONVERSATION_DEBUG_ENABLED =
+  String(process.env.DEBUG_SUB_ELEMENT_CONVERSATIONS || '').trim().toLowerCase() === 'true'
+
+const initialCostingCache = new Map()
+const costingDisplayDataCache = new Map()
+const approvedUsersCache = new Map()
 
 function createHttpError(statusCode, message) {
   const error = new Error(message)
@@ -26,6 +36,72 @@ function getTrimmedText(value) {
 
 function getLookupValue(value) {
   return getTrimmedText(value).toLowerCase()
+}
+
+function debugConversationLog(message, payload) {
+  if (!CONVERSATION_DEBUG_ENABLED) {
+    return
+  }
+
+  if (payload === undefined) {
+    console.log(message)
+    return
+  }
+
+  console.log(message, payload)
+}
+
+function getCacheValue(cache, key) {
+  const entry = cache.get(key)
+
+  if (!entry) {
+    return null
+  }
+
+  if (entry.value !== undefined && entry.expires_at > Date.now()) {
+    return entry.value
+  }
+
+  if (entry.promise) {
+    return entry.promise
+  }
+
+  cache.delete(key)
+  return null
+}
+
+function setCacheValue(cache, key, value, ttlMs = CONVERSATION_CACHE_TTL_MS) {
+  cache.set(key, {
+    value,
+    expires_at: Date.now() + ttlMs,
+  })
+
+  return value
+}
+
+async function getOrLoadCachedValue(cache, key, loader, ttlMs = CONVERSATION_CACHE_TTL_MS) {
+  const cachedValue = getCacheValue(cache, key)
+
+  if (cachedValue !== null) {
+    return cachedValue
+  }
+
+  const loadingPromise = (async () => {
+    try {
+      const value = await loader()
+      return setCacheValue(cache, key, value, ttlMs)
+    } catch (error) {
+      cache.delete(key)
+      throw error
+    }
+  })()
+
+  cache.set(key, {
+    promise: loadingPromise,
+    expires_at: Date.now() + ttlMs,
+  })
+
+  return loadingPromise
 }
 
 function escapeRegExp(value) {
@@ -95,30 +171,35 @@ function getTemplateByKey(key) {
 }
 
 async function getInitialCosting(costingId) {
-  console.log('[getInitialCosting] Validating costing...', { costingId })
+  debugConversationLog('[getInitialCosting] Validating costing...', { costingId })
 
   const normalizedCostingId = Number.parseInt(String(costingId || '').trim(), 10)
 
   if (!Number.isInteger(normalizedCostingId) || normalizedCostingId <= 0) {
-    console.error('[getInitialCosting] Invalid costing ID:', { costingId, normalized: normalizedCostingId })
     throw createHttpError(400, 'Invalid costing identifier.')
   }
 
-  const costing = await RfqCosting.findByPk(normalizedCostingId)
+  const costing = await getOrLoadCachedValue(
+    initialCostingCache,
+    String(normalizedCostingId),
+    async () =>
+      RfqCosting.findByPk(normalizedCostingId, {
+        attributes: ['id', 'type', 'rfq_id', 'reference'],
+        raw: true,
+      }),
+  )
 
   if (!costing) {
-    console.error('[getInitialCosting] Costing not found:', { costingId: normalizedCostingId })
     throw createHttpError(404, `RFQ Costing with ID ${normalizedCostingId} not found.`)
   }
 
-  console.log('[getInitialCosting] Costing found:', {
+  debugConversationLog('[getInitialCosting] Costing found:', {
     id: costing.id,
     type: costing.type,
     rfq_id: costing.rfq_id,
   })
 
   if (costing.type !== 'Initial Costing') {
-    console.error('[getInitialCosting] Invalid costing type:', { id: costing.id, type: costing.type })
     throw createHttpError(
       400,
       `Conversation is available only for Initial Costing steps. Found: ${costing.type}`,
@@ -129,19 +210,35 @@ async function getInitialCosting(costingId) {
 }
 
 async function ensureSubElementForCosting(costingId, template) {
-  const [subElement] = await RfqCostingInitialSubElement.findOrCreate({
+  let subElement = await RfqCostingInitialSubElement.findOne({
     where: {
       rfq_costing_id: costingId,
       key: template.key,
     },
-    defaults: {
-      rfq_costing_id: costingId,
-      key: template.key,
-      title: template.title,
-      status: template.defaultStatus,
-      approval_status: template.defaultApprovalStatus,
-    },
   })
+
+  if (!subElement) {
+    try {
+      subElement = await RfqCostingInitialSubElement.create({
+        rfq_costing_id: costingId,
+        key: template.key,
+        title: template.title,
+        status: template.defaultStatus,
+        approval_status: template.defaultApprovalStatus,
+      })
+    } catch (error) {
+      if (error?.name !== 'SequelizeUniqueConstraintError') {
+        throw error
+      }
+
+      subElement = await RfqCostingInitialSubElement.findOne({
+        where: {
+          rfq_costing_id: costingId,
+          key: template.key,
+        },
+      })
+    }
+  }
 
   if (subElement.title !== template.title) {
     await subElement.update({ title: template.title })
@@ -150,13 +247,26 @@ async function ensureSubElementForCosting(costingId, template) {
   return subElement
 }
 
+async function getCachedCostingDisplayData(costing) {
+  const rawCosting =
+    costing && typeof costing.toJSON === 'function' ? costing.toJSON() : costing || {}
+  const costingCacheKey =
+    rawCosting.id === undefined || rawCosting.id === null
+      ? `${rawCosting.rfq_id || 'unknown'}:${rawCosting.type || 'unknown'}`
+      : String(rawCosting.id)
+
+  return getOrLoadCachedValue(costingDisplayDataCache, costingCacheKey, async () =>
+    getCostingDisplayData(rawCosting),
+  )
+}
+
 async function getConversationContext(costingId, key) {
-  console.log('[getConversationContext] Starting...', { costingId, key })
+  debugConversationLog('[getConversationContext] Starting...', { costingId, key })
 
   const costing = await getInitialCosting(costingId)
   const template = getTemplateByKey(key)
 
-  console.log('[getConversationContext] Template lookup:', {
+  debugConversationLog('[getConversationContext] Template lookup:', {
     requestedKey: key,
     found: !!template,
     templateKey: template?.key,
@@ -172,10 +282,10 @@ async function getConversationContext(costingId, key) {
 
   const [subElement, costingDisplayData] = await Promise.all([
     ensureSubElementForCosting(costing.id, template),
-    getCostingDisplayData(costing),
+    getCachedCostingDisplayData(costing),
   ])
 
-  console.log('[getConversationContext] Context created:', {
+  debugConversationLog('[getConversationContext] Context created:', {
     costingId: costing.id,
     templateKey: template.key,
     subElementId: subElement.id,
@@ -439,17 +549,24 @@ function resolveMentionedUsersFromPayload(mentions, users = [], authorUserId = n
   return Array.from(mentionedUsersMap.values())
 }
 
+async function getApprovedUsers() {
+  return getOrLoadCachedValue(approvedUsersCache, 'approved-users', async () =>
+    User.findAll({
+      where: {
+        approval_status: 'approved',
+      },
+      attributes: ['id', 'full_name', 'email', 'role', 'approvable_sub_elements'],
+      order: [
+        ['full_name', 'ASC'],
+        ['email', 'ASC'],
+      ],
+      raw: true,
+    }),
+  )
+}
+
 async function resolveConversationParticipants(subElement, template, conversationItems = []) {
-  const users = await User.findAll({
-    where: {
-      approval_status: 'approved',
-    },
-    attributes: ['id', 'full_name', 'email', 'role', 'approvable_sub_elements'],
-    order: [
-      ['full_name', 'ASC'],
-      ['email', 'ASC'],
-    ],
-  })
+  const users = await getApprovedUsers()
 
   const participantsByKey = new Map()
 
@@ -707,6 +824,7 @@ async function serializeConversationMessages(items) {
           id: authorIds,
         },
         attributes: ['id', 'full_name', 'email', 'role'],
+        raw: true,
       })
     : []
   const authorsById = new Map(authors.map((author) => [author.id, author]))
@@ -736,11 +854,15 @@ function buildConversationPayload({
 }
 
 async function getConversation(costingId, key, authenticatedUser) {
-  console.log('[getConversation] Starting...', { costingId, key, userId: authenticatedUser?.id })
+  debugConversationLog('[getConversation] Starting...', {
+    costingId,
+    key,
+    userId: authenticatedUser?.id,
+  })
 
   try {
     const context = await getConversationContext(costingId, key)
-    console.log('[getConversation] Context retrieved:', {
+    debugConversationLog('[getConversation] Context retrieved:', {
       costingId: context.costing.id,
       templateKey: context.template.key,
       subElementId: context.subElement.id,
@@ -751,10 +873,21 @@ async function getConversation(costingId, key, authenticatedUser) {
         rfq_costing_id: context.costing.id,
         sub_element_key: context.template.key,
       },
+      attributes: [
+        'id',
+        'rfq_costing_id',
+        'sub_element_key',
+        'user_id',
+        'message',
+        'mentions',
+        'attachments',
+        'created_at',
+      ],
       order: [
         ['created_at', 'ASC'],
         ['id', 'ASC'],
       ],
+      raw: true,
     })
 
     const participants = await resolveConversationParticipants(
@@ -762,7 +895,7 @@ async function getConversation(costingId, key, authenticatedUser) {
       context.template,
       items,
     )
-    console.log('[getConversation] Participants resolved:', {
+    debugConversationLog('[getConversation] Participants resolved:', {
       count: participants.length,
       participantRoles: participants.map((p) => Array.from(p.scopes || [])).flat(),
     })
@@ -771,7 +904,7 @@ async function getConversation(costingId, key, authenticatedUser) {
 
     const serializedItems = await serializeConversationMessages(items)
 
-    console.log('[getConversation] Success! Messages count:', serializedItems.length)
+    debugConversationLog('[getConversation] Success! Messages count:', serializedItems.length)
 
     return {
       conversation: buildConversationPayload({
@@ -801,10 +934,21 @@ async function createConversationMessage(costingId, key, payload = {}, authentic
       rfq_costing_id: context.costing.id,
       sub_element_key: context.template.key,
     },
+    attributes: [
+      'id',
+      'rfq_costing_id',
+      'sub_element_key',
+      'user_id',
+      'message',
+      'mentions',
+      'attachments',
+      'created_at',
+    ],
     order: [
       ['created_at', 'ASC'],
       ['id', 'ASC'],
     ],
+    raw: true,
   })
   const participants = await resolveConversationParticipants(
     context.subElement,
@@ -815,12 +959,7 @@ async function createConversationMessage(costingId, key, payload = {}, authentic
   assertConversationAccess(authenticatedUser, participants)
 
   const normalizedPayload = normalizeMessagePayload(payload)
-  const approvedUsers = await User.findAll({
-    where: {
-      approval_status: 'approved',
-    },
-    attributes: ['id', 'full_name', 'email', 'role'],
-  })
+  const approvedUsers = await getApprovedUsers()
   const mentionedUsersFromPayload = resolveMentionedUsersFromPayload(
     payload?.mentions,
     approvedUsers,

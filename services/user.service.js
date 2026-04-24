@@ -46,16 +46,51 @@ const TOKEN_DURATION_SECONDS =
 const RESET_TOKEN_DURATION_SECONDS =
   parseDurationToSeconds(process.env.RESET_TOKEN_TTL) ||
   DEFAULT_RESET_TOKEN_DURATION_SECONDS
+const AUTH_USER_CACHE_TTL_MS = Math.max(
+  Number.parseInt(String(process.env.AUTH_USER_CACHE_TTL_MS || '5000').trim(), 10) || 5000,
+  1000,
+)
 
 const AUTH_SECRET =
   process.env.AUTH_SECRET ||
   process.env.JWT_SECRET ||
   'change-me-in-production'
 
+const authenticatedUserCache = new Map()
+
 function createHttpError(statusCode, message) {
   const error = new Error(message)
   error.statusCode = statusCode
   return error
+}
+
+function getCachedAuthenticatedUser(token) {
+  const cacheEntry = authenticatedUserCache.get(token)
+
+  if (!cacheEntry) {
+    return null
+  }
+
+  if (cacheEntry.expires_at > Date.now()) {
+    return cacheEntry.user
+  }
+
+  authenticatedUserCache.delete(token)
+  return null
+}
+
+function setCachedAuthenticatedUser(token, user, payload = {}) {
+  const tokenExpiresAt = Number.isInteger(payload?.exp) ? payload.exp * 1000 : 0
+  const cacheExpiresAt = Date.now() + AUTH_USER_CACHE_TTL_MS
+  const expiresAt =
+    tokenExpiresAt > 0 ? Math.min(tokenExpiresAt, cacheExpiresAt) : cacheExpiresAt
+
+  authenticatedUserCache.set(token, {
+    user,
+    expires_at: expiresAt,
+  })
+
+  return user
 }
 
 function extractBearerToken(authorizationHeader) {
@@ -198,6 +233,12 @@ async function authenticateAccessToken(token) {
     throw createHttpError(401, 'Authentication is required.')
   }
 
+  const cachedUser = getCachedAuthenticatedUser(token)
+
+  if (cachedUser) {
+    return cachedUser
+  }
+
   const user = await User.findById(payload.sub)
 
   if (!user) {
@@ -208,7 +249,7 @@ async function authenticateAccessToken(token) {
     throw createHttpError(401, 'Authentication is required.')
   }
 
-  return User.sanitizeUser(user)
+  return setCachedAuthenticatedUser(token, User.sanitizeUser(user), payload)
 }
 
 async function authenticateAccessTokenFromHeader(authorizationHeader) {

@@ -69,9 +69,6 @@ async function getSubElementByKey(req, res) {
 
 async function updateSubElementByKey(req, res) {
   try {
-    console.log(req.params.costingId)
-    console.log(req.params.key)
-    console.log(req.body)
     const result = await rfqCostingInitialSubElementService.updateSubElementByKey(
       req.params.costingId,
       req.params.key,
@@ -109,12 +106,6 @@ async function approveSubElementByToken(req, res) {
 
 async function getSubElementConversation(req, res) {
   try {
-    console.log('[getSubElementConversation] Request:', {
-      costingId: req.params.costingId,
-      key: req.params.key,
-      headers: req.headers,
-    })
-
     const authenticatedUser = await getAuthenticatedUser(req)
     const result = await subElementConversationService.getConversation(
       req.params.costingId,
