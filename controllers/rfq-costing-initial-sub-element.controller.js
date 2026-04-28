@@ -11,6 +11,10 @@ function handleControllerError(res, error) {
   })
 }
 
+function shouldLogControllerError(error) {
+  return !error?.statusCode || error.statusCode >= 500
+}
+
 async function getAuthenticatedUser(req) {
   return userService.authenticateAccessTokenFromHeader(req.headers.authorization)
 }
@@ -114,13 +118,15 @@ async function getSubElementConversation(req, res) {
     )
     res.status(200).json(result)
   } catch (error) {
-    console.error('[getSubElementConversation] Error:', {
-      message: error.message,
-      statusCode: error.statusCode,
-      costingId: req.params.costingId,
-      key: req.params.key,
-      stack: error.stack,
-    })
+    if (shouldLogControllerError(error)) {
+      console.error('[getSubElementConversation] Error:', {
+        message: error.message,
+        statusCode: error.statusCode,
+        costingId: req.params.costingId,
+        key: req.params.key,
+        stack: error.stack,
+      })
+    }
     handleControllerError(res, error)
   }
 }

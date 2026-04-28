@@ -167,14 +167,6 @@ async function sendMailWithNotification({
   notification = null,
   notificationRecipients = null,
 }) {
-  const emailResponse = await sendMail({
-    to,
-    subject,
-    text,
-    html,
-    attachments,
-  })
-
   if (notification) {
     try {
       await notificationService.createNotificationsForRecipients(
@@ -186,7 +178,17 @@ async function sendMailWithNotification({
     }
   }
 
-  return emailResponse
+  if (!to) {
+    return null
+  }
+
+  return sendMail({
+    to,
+    subject,
+    text,
+    html,
+    attachments,
+  })
 }
 
 function getBrandLogoAttachment() {
@@ -497,6 +499,7 @@ async function sendSubElementApprovalRequest(
   costingId,
   subElementTitle,
   approvalToken,
+  link = null,
 ) {
   if (!approverEmail || !approverEmail.trim()) {
     throw new Error('Approver email is required to send approval request.')
@@ -507,6 +510,7 @@ async function sendSubElementApprovalRequest(
   const safeProjectDisplayName = normalizedProjectContext.project_display_name
   const safeCostingId = getDisplayValue(costingId)
   const safeSubElementTitle = getDisplayValue(subElementTitle, 'Sub-element')
+  const safeLink = getOptionalText(link)
   const approvalPageUrl = `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/approve-sub-element/${encodeURIComponent(approvalToken)}`
   const intro = `A pilot has completed the sub-element "${safeSubElementTitle}" and is requesting your approval.`
   const notificationMessage = buildNotificationSummary([
@@ -519,6 +523,7 @@ async function sendSubElementApprovalRequest(
     `Project: ${safeProjectDisplayName}`,
     `Costing ID: ${safeCostingId}`,
     `Pilot: ${safePilotName}`,
+    safeLink ? `Link: ${safeLink}` : '',
     '',
     'Please select one of the following approval statuses:',
     '- Approved',
@@ -542,6 +547,12 @@ async function sendSubElementApprovalRequest(
           ${renderDetailRow('Costing ID', safeCostingId)}
           ${renderDetailRow('Sub-element', safeSubElementTitle)}
           ${renderDetailRow('Pilot', safePilotName)}
+          ${safeLink ? `
+            <tr>
+              <td style="padding:0 0 12px 0;font-size:0.95rem;font-weight:700;color:#0a3452;vertical-align:top;width:112px;">${escapeHtml('Link')}</td>
+              <td style="padding:0 0 12px 0;font-size:0.98rem;color:#162231;"><a href="${escapeHtml(safeLink)}" style="color:#ef7807;text-decoration:underline;font-weight:700;" target="_blank">Click here to open the link</a></td>
+            </tr>
+          ` : ''}
         </table>
       </div>
       <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
@@ -588,6 +599,7 @@ async function sendSubElementApprovalRequest(
         costing_id: safeCostingId,
         sub_element_title: safeSubElementTitle,
         pilot: safePilotName,
+        link: safeLink,
       },
     },
   })
@@ -737,6 +749,88 @@ async function sendPilotAssignmentNotification(
   })
 }
 
+async function sendSubElementReadyToStartNotification(
+  pilotEmail,
+  pilotName,
+  completedSubElementTitle,
+  nextSubElementTitle,
+  projectContext,
+  costingId,
+  notificationRecipients = null,
+) {
+  const normalizedProjectContext = normalizeProjectContext(projectContext)
+  const safePilotName = getDisplayValue(pilotName, 'Pilot')
+  const safeCompletedSubElementTitle = getDisplayValue(completedSubElementTitle, 'Previous step')
+  const safeNextSubElementTitle = getDisplayValue(nextSubElementTitle, 'Your next step')
+  const safeProjectDisplayName = normalizedProjectContext.project_display_name
+  const safeCostingId = getDisplayValue(costingId)
+  const costingPageUrl = getWorkspaceCostingUrl()
+  const intro = `Hello ${safePilotName}, the step "${safeCompletedSubElementTitle}" has been completed. You can now start your next step in PL Assembly.`
+  const notificationMessage = buildNotificationSummary([
+    safeProjectDisplayName,
+    safeNextSubElementTitle,
+    'Ready to start',
+  ])
+  const text = [
+    `Hello ${safePilotName},`,
+    '',
+    `The step "${safeCompletedSubElementTitle}" has been completed.`,
+    `You can now start your step: "${safeNextSubElementTitle}"`,
+    '',
+    `Project: ${safeProjectDisplayName}`,
+    `Costing ID: ${safeCostingId}`,
+    '',
+    'Please open PL Assembly and start your step.',
+  ].join('\n')
+
+  const html = renderEmailShell({
+    eyebrow: 'Step ready',
+    title: 'Your step is ready to start',
+    intro,
+    contentHtml: `
+      <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+          ${renderDetailRow('Completed step', safeCompletedSubElementTitle)}
+          ${renderDetailRow('Your step', safeNextSubElementTitle)}
+          ${renderDetailRow('Project', safeProjectDisplayName)}
+          ${renderDetailRow('Costing ID', safeCostingId)}
+        </table>
+      </div>
+      <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
+        Please open the application and start your step.
+      </p>
+    `,
+    actionLabel: 'Open workspace',
+    actionUrl: costingPageUrl,
+  })
+
+  return sendMailWithNotification({
+    to: pilotEmail,
+    subject: 'PL Assembly - Your step is ready to start',
+    text,
+    html,
+    attachments: getBrandLogoAttachment(),
+    notificationRecipients,
+    notification: {
+      type: 'sub-element-ready-to-start',
+      subject: 'PL Assembly - Your step is ready to start',
+      title: 'Your step is ready to start',
+      message: notificationMessage || intro,
+      body: null,
+      action_label: 'Open workspace',
+      action_url: costingPageUrl,
+      metadata: {
+        rfq_id: normalizedProjectContext.rfq_id,
+        project_display_name: safeProjectDisplayName,
+        costing_id: safeCostingId,
+        completed_sub_element_title: safeCompletedSubElementTitle,
+        sub_element_title: safeNextSubElementTitle,
+        pilot: safePilotName,
+      },
+    },
+  })
+}
+
 async function sendSubElementStatusNotification(
   managerEmail,
   pilotName,
@@ -855,5 +949,6 @@ module.exports = {
   sendUserApprovalConfirmation,
   sendSubElementApprovalRequest,
   sendPilotAssignmentNotification,
+  sendSubElementReadyToStartNotification,
   sendSubElementStatusNotification,
 }

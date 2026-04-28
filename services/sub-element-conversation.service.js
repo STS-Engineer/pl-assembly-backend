@@ -51,6 +51,10 @@ function debugConversationLog(message, payload) {
   console.log(message, payload)
 }
 
+function shouldLogConversationError(error) {
+  return !error?.statusCode || error.statusCode >= 500
+}
+
 function getCacheValue(cache, key) {
   const entry = cache.get(key)
 
@@ -915,14 +919,16 @@ async function getConversation(costingId, key, authenticatedUser) {
       total_count: serializedItems.length,
     }
   } catch (error) {
-    console.error('[getConversation] Failed:', {
-      message: error.message,
-      statusCode: error.statusCode,
-      costingId,
-      key,
-      userId: authenticatedUser?.id,
-      stack: error.stack,
-    })
+    if (shouldLogConversationError(error)) {
+      console.error('[getConversation] Failed:', {
+        message: error.message,
+        statusCode: error.statusCode,
+        costingId,
+        key,
+        userId: authenticatedUser?.id,
+        stack: error.stack,
+      })
+    }
     throw error
   }
 }

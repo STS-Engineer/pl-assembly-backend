@@ -24,6 +24,9 @@ const DESIGN_TYPE_ALIASES = {
   'avo': 'AVO Design',
 }
 
+const DEFAULT_PILOT_PLACEHOLDER = 'Pilot name'
+const LEGACY_PILOT_PLACEHOLDERS = new Set(['pilot name', 'project pilot'])
+
 function createHttpError(statusCode, message) {
   const error = new Error(message)
   error.statusCode = statusCode
@@ -121,6 +124,19 @@ function normalizeDueDate(value) {
   }
 
   return parsedDate.toISOString().slice(0, 10)
+}
+
+function normalizeOptionalLink(value) {
+  return getTrimmedText(value) || null
+}
+
+function isPilotPlaceholderValue(value) {
+  const normalizedValue = normalizeLookupKey(value)
+  return !normalizedValue || LEGACY_PILOT_PLACEHOLDERS.has(normalizedValue)
+}
+
+function getPilotDisplayValue(user = {}) {
+  return getTrimmedText(user.full_name) || getTrimmedText(user.email) || DEFAULT_PILOT_PLACEHOLDER
 }
 
 function getRequestedRole(payload = {}) {
@@ -281,6 +297,54 @@ async function getApproversBySubElementKeyMap() {
   }
 }
 
+async function getDefaultPilotsBySubElementKeyMap() {
+  try {
+    const users = await User.findAll({
+      where: {
+        approval_status: 'approved',
+      },
+      attributes: ['id', 'email', 'full_name', 'pilot_sub_elements'],
+      order: [
+        ['full_name', 'ASC'],
+        ['email', 'ASC'],
+        ['id', 'ASC'],
+      ],
+    })
+
+    return users.reduce((pilotsByKey, user) => {
+      const pilotSubElements = Array.isArray(user.pilot_sub_elements) ? user.pilot_sub_elements : []
+
+      pilotSubElements.forEach((subElementKey) => {
+        const normalizedKey = getTrimmedText(subElementKey)
+
+        if (!normalizedKey) {
+          return
+        }
+
+        if (!pilotsByKey.has(normalizedKey)) {
+          pilotsByKey.set(normalizedKey, [])
+        }
+
+        pilotsByKey.get(normalizedKey).push(user)
+      })
+
+      return pilotsByKey
+    }, new Map())
+  } catch (error) {
+    console.error('Error building default pilots map:', error.message)
+    return new Map()
+  }
+}
+
+function getDefaultPilotValueForSubElementKey(subElementKey, pilotsByKey = null) {
+  if (!(pilotsByKey instanceof Map)) {
+    return DEFAULT_PILOT_PLACEHOLDER
+  }
+
+  const candidatePilot = (pilotsByKey.get(getTrimmedText(subElementKey)) || [])[0]
+  return candidatePilot ? getPilotDisplayValue(candidatePilot) : DEFAULT_PILOT_PLACEHOLDER
+}
+
 function buildSubElementDefinition(template) {
   return {
     key: template.key,
@@ -344,6 +408,7 @@ async function serializeSubElement(
     approval_status: rawSubElement.approval_status,
     duration: rawSubElement.duration,
     due_date: rawSubElement.due_date,
+    link: rawSubElement.link,
     design_type: rawSubElement.design_type,
     rfq_id: costingDisplayData?.rfq_id || null,
     project_display_name: costingDisplayData?.project_display_name || null,
@@ -371,7 +436,10 @@ async function getInitialCosting(costingId) {
   return costing
 }
 
-async function ensureSubElementForCosting(costingId, template) {
+async function ensureSubElementForCosting(costingId, template, defaultPilotsByKey = null) {
+  const pilotsByKey =
+    defaultPilotsByKey instanceof Map ? defaultPilotsByKey : await getDefaultPilotsBySubElementKeyMap()
+  const defaultPilot = getDefaultPilotValueForSubElementKey(template.key, pilotsByKey)
   const [item] = await RfqCostingInitialSubElement.findOrCreate({
     where: {
       rfq_costing_id: costingId,
@@ -381,13 +449,24 @@ async function ensureSubElementForCosting(costingId, template) {
       rfq_costing_id: costingId,
       key: template.key,
       title: template.title,
+      pilot: defaultPilot,
       status: template.defaultStatus,
       approval_status: template.defaultApprovalStatus,
     },
   })
 
+  const updateData = {}
+
   if (item.title !== template.title) {
-    await item.update({ title: template.title })
+    updateData.title = template.title
+  }
+
+  if (isPilotPlaceholderValue(item.pilot) && item.pilot !== defaultPilot) {
+    updateData.pilot = defaultPilot
+  }
+
+  if (Object.keys(updateData).length > 0) {
+    await item.update(updateData)
   }
 
   return item
@@ -415,12 +494,15 @@ async function ensureDefaultSubElementsByCostingIds(costingIds = []) {
   const templateKeys = templates.map((template) => template.key)
   const templateOrderLookup = getTemplateOrderLookup()
 
-  const existingItems = await RfqCostingInitialSubElement.findAll({
-    where: {
-      rfq_costing_id: normalizedCostingIds,
-      key: templateKeys,
-    },
-  })
+  const [existingItems, defaultPilotsByKey] = await Promise.all([
+    RfqCostingInitialSubElement.findAll({
+      where: {
+        rfq_costing_id: normalizedCostingIds,
+        key: templateKeys,
+      },
+    }),
+    getDefaultPilotsBySubElementKeyMap(),
+  ])
 
   const existingItemsByCompositeKey = existingItems.reduce((lookup, item) => {
     lookup.set(`${item.rfq_costing_id}:${item.key}`, item)
@@ -440,14 +522,29 @@ async function ensureDefaultSubElementsByCostingIds(costingIds = []) {
           rfq_costing_id: costingId,
           key: template.key,
           title: template.title,
+          pilot: getDefaultPilotValueForSubElementKey(template.key, defaultPilotsByKey),
           status: template.defaultStatus,
           approval_status: template.defaultApprovalStatus,
         })
         return
       }
 
+      const updateData = {}
+
       if (existingItem.title !== template.title) {
-        titleUpdateOperations.push(existingItem.update({ title: template.title }))
+        updateData.title = template.title
+      }
+
+      if (isPilotPlaceholderValue(existingItem.pilot)) {
+        const defaultPilot = getDefaultPilotValueForSubElementKey(template.key, defaultPilotsByKey)
+
+        if (existingItem.pilot !== defaultPilot) {
+          updateData.pilot = defaultPilot
+        }
+      }
+
+      if (Object.keys(updateData).length > 0) {
+        titleUpdateOperations.push(existingItem.update(updateData))
       }
     })
   })
@@ -596,6 +693,8 @@ async function areSubElementsApproved(costingId, targetKeys) {
 }
 
 async function triggerSubElements(costing, sourceItem, targetKeys) {
+  const defaultPilotsByKey = await getDefaultPilotsBySubElementKeyMap()
+
   for (const targetKey of targetKeys) {
     const template = getTemplateByKey(targetKey)
 
@@ -604,7 +703,7 @@ async function triggerSubElements(costing, sourceItem, targetKeys) {
       continue
     }
 
-    const subElement = await ensureSubElementForCosting(costing.id, template)
+    const subElement = await ensureSubElementForCosting(costing.id, template, defaultPilotsByKey)
     const canOpenSubElement = shouldOpenTriggeredSubElement(subElement)
 
     if (canOpenSubElement) {
@@ -618,6 +717,61 @@ async function triggerSubElements(costing, sourceItem, targetKeys) {
     }
 
     await notifyManagersThatSubElementWasTriggered(costing, sourceItem, subElement)
+  }
+}
+
+async function notifyPilotsThatSubElementsAreReadyToStart(costing, sourceItem, targetKeys) {
+  if (!Array.isArray(targetKeys) || targetKeys.length === 0) {
+    return
+  }
+
+  const defaultPilotsByKey = await getDefaultPilotsBySubElementKeyMap()
+  const costingDisplayData = await getCostingDisplayData(costing)
+
+  for (const targetKey of targetKeys) {
+    const template = getTemplateByKey(targetKey)
+
+    if (!template) {
+      console.warn(`Sub-element template not found for key "${targetKey}".`)
+      continue
+    }
+
+    const subElement = await ensureSubElementForCosting(costing.id, template, defaultPilotsByKey)
+
+    if (shouldOpenTriggeredSubElement(subElement)) {
+      await subElement.update({
+        status: 'Ready to start',
+      })
+    }
+
+    if (subElement.status === 'Done') {
+      continue
+    }
+
+    const resolvedPilotUser = await resolvePilotUser({
+      pilot: subElement.pilot,
+    })
+
+    if (!resolvedPilotUser) {
+      console.warn(`No pilot user found for sub-element "${targetKey}".`, {
+        pilot: subElement.pilot,
+        costingId: costing.id,
+      })
+      continue
+    }
+
+    await emailService.sendSubElementReadyToStartNotification(
+      resolvedPilotUser.email || null,
+      getPilotDisplayValue(resolvedPilotUser),
+      sourceItem.title || getTemplateByKey(sourceItem.key)?.title || sourceItem.key,
+      subElement.title || template.title,
+      costingDisplayData,
+      costing.id,
+      {
+        user_id: resolvedPilotUser.id,
+        email: resolvedPilotUser.email || null,
+      },
+    )
   }
 }
 
@@ -952,9 +1106,14 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     )
   }
 
+  if (payload.link !== undefined || payload.url !== undefined || payload.lien !== undefined) {
+    updateData.link = normalizeOptionalLink(payload.link ?? payload.url ?? payload.lien)
+  }
+
 
   const previousApprovalStatus = item.approval_status
   const previousPilot = item.pilot
+  const previousStatus = item.status
   const resolvedPilotUser = updateData.pilot !== undefined ? await resolvePilotUser(payload) : null
 
   if (Object.keys(updateData).length > 0) {
@@ -993,9 +1152,10 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
   try {
     const statusWasUpdated = updateData.status !== undefined
     const statusIsDone = updateData.status === 'Done'
+    const statusJustDone = statusIsDone && previousStatus !== 'Done'
     const statusIsNotifiable = ['Help!!!', 'Late!', 'Escalation level 1'].includes(updateData.status)
 
-    if (statusWasUpdated && statusIsDone) {
+    if (statusWasUpdated && statusJustDone) {
       ;(async () => {
         try {
           const approvers = await findApproversBySubElementKey(key)
@@ -1017,7 +1177,8 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
                   costingDisplayData,
                   costing.id,
                   template.title,
-                  approvalToken
+                  approvalToken,
+                  item.link
                 )
               }
             }
@@ -1060,6 +1221,27 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     }
   } catch (error) {
     console.error('❌ Error in email trigger logic:', error.message)
+  }
+
+  const bomSpecCompletedJustDone = key === 'bom-spec-completed' && updateData.status === 'Done' && previousStatus !== 'Done'
+
+  if (bomSpecCompletedJustDone) {
+    ;(async () => {
+      try {
+        await item.reload()
+        await notifyPilotsThatSubElementsAreReadyToStart(
+          costing,
+          item,
+          getSubElementKeysAfterTechnicalFeasibilityAndBomSpec(),
+        )
+      } catch (error) {
+        console.error(
+          'Error while notifying pilots after "BoM and spec are correctly completed inside the costing file" was marked Done:',
+          error.message,
+        )
+        console.error('Full error:', error)
+      }
+    })()
   }
 
   const approvalJustGranted =
@@ -1388,6 +1570,7 @@ async function getSubElementByApprovalToken(token, context = {}) {
       approval_status: item.approval_status,
       duration: item.duration,
       due_date: item.due_date,
+      link: item.link,
       design_type: item.design_type,
       rfq_id: costingDisplayData.rfq_id,
       project_display_name: costingDisplayData.project_display_name,
@@ -1498,6 +1681,7 @@ async function approveSubElementByToken(token, payload = {}) {
       approval_status: item.approval_status,
       duration: item.duration,
       due_date: item.due_date,
+      link: item.link,
       design_type: item.design_type,
       rfq_id: costingDisplayData.rfq_id,
       project_display_name: costingDisplayData.project_display_name,

@@ -178,6 +178,13 @@ function verifySignedToken(token) {
   return payload
 }
 
+function isAccessTokenValidationError(error) {
+  return (
+    error?.statusCode === 400 &&
+    (error.message === 'Token invalide.' || error.message === 'Token expire.')
+  )
+}
+
 function buildPasswordFingerprint(user) {
   return crypto.createHash('sha256').update(String(user.password || '')).digest('hex')
 }
@@ -227,7 +234,17 @@ function buildAuthResponse(message, user) {
 }
 
 async function authenticateAccessToken(token) {
-  const payload = verifySignedToken(token)
+  let payload
+
+  try {
+    payload = verifySignedToken(token)
+  } catch (error) {
+    if (isAccessTokenValidationError(error)) {
+      throw createHttpError(401, error.message)
+    }
+
+    throw error
+  }
 
   if (payload.type !== 'access') {
     throw createHttpError(401, 'Authentication is required.')

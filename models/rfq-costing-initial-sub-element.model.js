@@ -159,6 +159,10 @@ const RfqCostingInitialSubElement = sequelize.define(
       type: DataTypes.DATEONLY,
       allowNull: true,
     },
+    link: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
     approval_token: {
       type: DataTypes.STRING,
       allowNull: true,
