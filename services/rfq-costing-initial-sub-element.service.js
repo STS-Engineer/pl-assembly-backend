@@ -126,10 +126,6 @@ function normalizeDueDate(value) {
   return parsedDate.toISOString().slice(0, 10)
 }
 
-function normalizeOptionalLink(value) {
-  return getTrimmedText(value) || null
-}
-
 function isPilotPlaceholderValue(value) {
   const normalizedValue = normalizeLookupKey(value)
   return !normalizedValue || LEGACY_PILOT_PLACEHOLDERS.has(normalizedValue)
@@ -143,9 +139,16 @@ function getRequestedRole(payload = {}) {
   return normalizeRole(payload?.current_role ?? payload?.currentRole ?? payload?.role)
 }
 
-function getTemplateByKey(key) {
-  const normalizedKey = getTrimmedText(key)
-  return RfqCostingInitialSubElement.TEMPLATES.find((template) => template.key === normalizedKey) || null
+function getTemplatesForCostingType(costingType) {
+  return RfqCostingInitialSubElement.getTemplatesForCostingType(costingType)
+}
+
+function getTemplateByKey(costingType, key) {
+  return RfqCostingInitialSubElement.getTemplateByKey(costingType, getTrimmedText(key))
+}
+
+function supportsDesignType(costingType) {
+  return getTrimmedText(costingType) === 'Initial Costing'
 }
 
 async function resolveApproverEmail(approverValue) {
@@ -154,7 +157,7 @@ async function resolveApproverEmail(approverValue) {
   }
 
   const trimmedValue = getTrimmedText(approverValue)
-  
+
   if (isValidEmail(trimmedValue)) {
     return trimmedValue
   }
@@ -165,7 +168,7 @@ async function resolveApproverEmail(approverValue) {
         full_name: trimmedValue,
       },
     })
-    
+
     if (user && user.email) {
       return user.email
     }
@@ -408,7 +411,7 @@ async function serializeSubElement(
     approval_status: rawSubElement.approval_status,
     duration: rawSubElement.duration,
     due_date: rawSubElement.due_date,
-    link: rawSubElement.link,
+    link: costingDisplayData?.costing_link || rawSubElement.link || null,
     design_type: rawSubElement.design_type,
     rfq_id: costingDisplayData?.rfq_id || null,
     project_display_name: costingDisplayData?.project_display_name || null,
@@ -422,15 +425,18 @@ async function serializeSubElement(
   }
 }
 
-async function getInitialCosting(costingId) {
+async function getCostingWithSubElements(costingId) {
   const costing = await RfqCosting.findByPk(costingId)
 
   if (!costing) {
     throw createHttpError(404, 'RFQ Costing not found.')
   }
 
-  if (costing.type !== 'Initial Costing') {
-    throw createHttpError(400, 'This endpoint is available only for Initial Costing.')
+  if (!RfqCostingInitialSubElement.SUPPORTED_COSTING_TYPES.includes(costing.type)) {
+    throw createHttpError(
+      400,
+      `This endpoint is available only for supported costing sub-elements. Found: ${costing.type}.`,
+    )
   }
 
   return costing
@@ -490,9 +496,26 @@ async function ensureDefaultSubElementsByCostingIds(costingIds = []) {
     return new Map()
   }
 
-  const templates = RfqCostingInitialSubElement.TEMPLATES
-  const templateKeys = templates.map((template) => template.key)
-  const templateOrderLookup = getTemplateOrderLookup()
+  const costings = await RfqCosting.findAll({
+    where: {
+      id: normalizedCostingIds,
+      type: RfqCostingInitialSubElement.SUPPORTED_COSTING_TYPES,
+    },
+    attributes: ['id', 'type'],
+    order: [['id', 'ASC']],
+  })
+
+  if (costings.length === 0) {
+    return new Map()
+  }
+
+  const templateKeys = Array.from(
+    new Set(
+      costings.flatMap((costing) =>
+        getTemplatesForCostingType(costing.type).map((template) => template.key),
+      ),
+    ),
+  )
 
   const [existingItems, defaultPilotsByKey] = await Promise.all([
     RfqCostingInitialSubElement.findAll({
@@ -512,14 +535,16 @@ async function ensureDefaultSubElementsByCostingIds(costingIds = []) {
   const itemsToCreate = []
   const titleUpdateOperations = []
 
-  normalizedCostingIds.forEach((costingId) => {
+  costings.forEach((costing) => {
+    const templates = getTemplatesForCostingType(costing.type)
+
     templates.forEach((template) => {
-      const compositeKey = `${costingId}:${template.key}`
+      const compositeKey = `${costing.id}:${template.key}`
       const existingItem = existingItemsByCompositeKey.get(compositeKey)
 
       if (!existingItem) {
         itemsToCreate.push({
-          rfq_costing_id: costingId,
+          rfq_costing_id: costing.id,
           key: template.key,
           title: template.title,
           pilot: getDefaultPilotValueForSubElementKey(template.key, defaultPilotsByKey),
@@ -562,15 +587,19 @@ async function ensureDefaultSubElementsByCostingIds(costingIds = []) {
   const finalItems =
     itemsToCreate.length > 0 || titleUpdateOperations.length > 0
       ? await RfqCostingInitialSubElement.findAll({
-          where: {
-            rfq_costing_id: normalizedCostingIds,
-            key: templateKeys,
-          },
-        })
+        where: {
+          rfq_costing_id: normalizedCostingIds,
+          key: templateKeys,
+        },
+      })
       : existingItems
 
-  const itemsByCostingId = normalizedCostingIds.reduce((lookup, costingId) => {
-    lookup.set(String(costingId), [])
+  const itemsByCostingId = costings.reduce((lookup, costing) => {
+    lookup.set(String(costing.id), [])
+    return lookup
+  }, new Map())
+  const costingsById = costings.reduce((lookup, costing) => {
+    lookup.set(String(costing.id), costing)
     return lookup
   }, new Map())
 
@@ -586,6 +615,9 @@ async function ensureDefaultSubElementsByCostingIds(costingIds = []) {
 
   itemsByCostingId.forEach((items, costingKey) => {
     const itemsByKey = new Map(items.map((item) => [item.key, item]))
+    const costing = costingsById.get(costingKey)
+    const templates = getTemplatesForCostingType(costing?.type)
+    const templateOrderLookup = getTemplateOrderLookup(costing?.type)
     const orderedItems = templates
       .map((template) => itemsByKey.get(template.key))
       .filter(Boolean)
@@ -625,8 +657,40 @@ function getSubElementKeyAfterBomCostAndAssemblyCost() {
   return ['costing-file-reviewed']
 }
 
-function getTemplateOrderLookup() {
-  return RfqCostingInitialSubElement.TEMPLATES.reduce((lookup, template, index) => {
+function getImprovedSubElementKeysAfterCustomerFeedback() {
+  return ['technical-feasibility-assessment', 'bom-spec-completed', 'avo-design-assembly-2d']
+}
+
+function getImprovedSubElementKeysAfterTechnicalReview() {
+  return ['bom-cost-ready', 'assembly-cost-line']
+}
+
+function getImprovedSubElementKeysAfterCostingPreparation() {
+  return ['costing-file-reviewed']
+}
+
+function getImprovedSubElementKeysAfterCostingFileReview() {
+  return ['project-risks-opportunities-ebit-bridge']
+}
+
+function getLastCallSubElementKeysAfterCustomerFeedback() {
+  return ['technical-feasibility-assessment', 'bom-spec-completed', 'avo-design-assembly-2d']
+}
+
+function getLastCallSubElementKeysAfterTechnicalReview() {
+  return ['bom-cost-ready', 'assembly-cost-line']
+}
+
+function getLastCallSubElementKeysAfterCostingPreparation() {
+  return ['costing-file-reviewed']
+}
+
+function getLastCallSubElementKeysAfterCostingFileReview() {
+  return ['project-risks-opportunities-ebit-bridge']
+}
+
+function getTemplateOrderLookup(costingType) {
+  return getTemplatesForCostingType(costingType).reduce((lookup, template, index) => {
     lookup.set(template.key, index)
     return lookup
   }, new Map())
@@ -696,7 +760,7 @@ async function triggerSubElements(costing, sourceItem, targetKeys) {
   const defaultPilotsByKey = await getDefaultPilotsBySubElementKeyMap()
 
   for (const targetKey of targetKeys) {
-    const template = getTemplateByKey(targetKey)
+    const template = getTemplateByKey(costing.type, targetKey)
 
     if (!template) {
       console.warn(`Sub-element template not found for key "${targetKey}".`)
@@ -729,7 +793,7 @@ async function notifyPilotsThatSubElementsAreReadyToStart(costing, sourceItem, t
   const costingDisplayData = await getCostingDisplayData(costing)
 
   for (const targetKey of targetKeys) {
-    const template = getTemplateByKey(targetKey)
+    const template = getTemplateByKey(costing.type, targetKey)
 
     if (!template) {
       console.warn(`Sub-element template not found for key "${targetKey}".`)
@@ -763,7 +827,7 @@ async function notifyPilotsThatSubElementsAreReadyToStart(costing, sourceItem, t
     await emailService.sendSubElementReadyToStartNotification(
       resolvedPilotUser.email || null,
       getPilotDisplayValue(resolvedPilotUser),
-      sourceItem.title || getTemplateByKey(sourceItem.key)?.title || sourceItem.key,
+      sourceItem.title || getTemplateByKey(costing.type, sourceItem.key)?.title || sourceItem.key,
       subElement.title || template.title,
       costingDisplayData,
       costing.id,
@@ -775,7 +839,7 @@ async function notifyPilotsThatSubElementsAreReadyToStart(costing, sourceItem, t
   }
 }
 
-async function triggerWorkflowAfterApproval(costing, sourceItem) {
+async function triggerInitialWorkflowAfterApproval(costing, sourceItem) {
   switch (sourceItem.key) {
     case 'needed-data-understood':
       await triggerDesignDependentSubElements(costing, sourceItem, sourceItem.design_type)
@@ -816,6 +880,124 @@ async function triggerWorkflowAfterApproval(costing, sourceItem) {
     default:
       return
   }
+}
+
+async function triggerImprovedWorkflowAfterApproval(costing, sourceItem) {
+  switch (sourceItem.key) {
+    case 'needed-data-understood':
+      await triggerSubElements(
+        costing,
+        sourceItem,
+        getImprovedSubElementKeysAfterCustomerFeedback(),
+      )
+      return
+    case 'technical-feasibility-assessment':
+    case 'bom-spec-completed':
+    case 'avo-design-assembly-2d':
+      if (
+        await areSubElementsApproved(
+          costing.id,
+          getImprovedSubElementKeysAfterCustomerFeedback(),
+        )
+      ) {
+        await triggerSubElements(
+          costing,
+          sourceItem,
+          getImprovedSubElementKeysAfterTechnicalReview(),
+        )
+      }
+      return
+    case 'bom-cost-ready':
+    case 'assembly-cost-line':
+      if (
+        await areSubElementsApproved(
+          costing.id,
+          getImprovedSubElementKeysAfterTechnicalReview(),
+        )
+      ) {
+        await triggerSubElements(
+          costing,
+          sourceItem,
+          getImprovedSubElementKeysAfterCostingPreparation(),
+        )
+      }
+      return
+    case 'costing-file-reviewed':
+      await triggerSubElements(
+        costing,
+        sourceItem,
+        getImprovedSubElementKeysAfterCostingFileReview(),
+      )
+      return
+    default:
+      return
+  }
+}
+
+async function triggerLastCallWorkflowAfterApproval(costing, sourceItem) {
+  switch (sourceItem.key) {
+    case 'needed-data-understood':
+      await triggerSubElements(
+        costing,
+        sourceItem,
+        getLastCallSubElementKeysAfterCustomerFeedback(),
+      )
+      return
+    case 'technical-feasibility-assessment':
+    case 'bom-spec-completed':
+    case 'avo-design-assembly-2d':
+      if (
+        await areSubElementsApproved(
+          costing.id,
+          getLastCallSubElementKeysAfterCustomerFeedback(),
+        )
+      ) {
+        await triggerSubElements(
+          costing,
+          sourceItem,
+          getLastCallSubElementKeysAfterTechnicalReview(),
+        )
+      }
+      return
+    case 'bom-cost-ready':
+    case 'assembly-cost-line':
+      if (
+        await areSubElementsApproved(
+          costing.id,
+          getLastCallSubElementKeysAfterTechnicalReview(),
+        )
+      ) {
+        await triggerSubElements(
+          costing,
+          sourceItem,
+          getLastCallSubElementKeysAfterCostingPreparation(),
+        )
+      }
+      return
+    case 'costing-file-reviewed':
+      await triggerSubElements(
+        costing,
+        sourceItem,
+        getLastCallSubElementKeysAfterCostingFileReview(),
+      )
+      return
+    default:
+      return
+  }
+}
+
+async function triggerWorkflowAfterApproval(costing, sourceItem) {
+  if (costing.type === 'Improved Costing') {
+    await triggerImprovedWorkflowAfterApproval(costing, sourceItem)
+    return
+  }
+
+  if (costing.type === 'Last Call Costing') {
+    await triggerLastCallWorkflowAfterApproval(costing, sourceItem)
+    return
+  }
+
+  await triggerInitialWorkflowAfterApproval(costing, sourceItem)
 }
 
 async function notifyManagersThatSubElementWasTriggered(costing, sourceItem, subElement) {
@@ -868,14 +1050,22 @@ async function triggerDesignDependentSubElements(costing, sourceItem, designType
 }
 
 async function getOptions() {
+  const subElementsByCostingType = Object.fromEntries(
+    RfqCostingInitialSubElement.SUPPORTED_COSTING_TYPES.map((costingType) => [
+      costingType,
+      getTemplatesForCostingType(costingType).map((template) => buildSubElementDefinition(template)),
+    ]),
+  )
+
   return {
     role_options: [...RfqCostingInitialSubElement.ROLE_VALUES],
     status_options: [...RfqCostingInitialSubElement.STATUS_VALUES],
     approval_status_options: [...RfqCostingInitialSubElement.APPROVAL_STATUS_VALUES],
     design_type_options: [...RfqCostingInitialSubElement.DESIGN_TYPE_VALUES],
-    sub_elements: RfqCostingInitialSubElement.TEMPLATES.map((template) =>
+    sub_elements: getTemplatesForCostingType('Initial Costing').map((template) =>
       buildSubElementDefinition(template),
     ),
+    sub_elements_by_costing_type: subElementsByCostingType,
   }
 }
 
@@ -898,7 +1088,7 @@ async function getSubElementsByCostingIds(costingIds, context = {}) {
   const costings = await RfqCosting.findAll({
     where: {
       id: normalizedCostingIds,
-      type: 'Initial Costing',
+      type: RfqCostingInitialSubElement.SUPPORTED_COSTING_TYPES,
     },
     order: [['id', 'ASC']],
   })
@@ -918,7 +1108,7 @@ async function getSubElementsByCostingIds(costingIds, context = {}) {
       const costingItems = itemsByCostingId.get(costingKey) || []
       const serializedItems = await Promise.all(
         costingItems.map(async (item) => {
-          const template = getTemplateByKey(item.key)
+          const template = getTemplateByKey(costing.type, item.key)
           return serializeSubElement(
             item,
             template,
@@ -940,7 +1130,7 @@ async function getSubElementsByCostingIds(costingIds, context = {}) {
 }
 
 async function getSubElementsByCostingId(costingId, context = {}) {
-  const costing = await getInitialCosting(costingId)
+  const costing = await getCostingWithSubElements(costingId)
   const costingDisplayData = await getCostingDisplayData(costing)
   const currentRole = getRequestedRole(context)
   const [items, approversByKey] = await Promise.all([
@@ -955,7 +1145,7 @@ async function getSubElementsByCostingId(costingId, context = {}) {
     costing_type: costing.type,
     items: await Promise.all(
       items.map(async (item) => {
-        const template = getTemplateByKey(item.key)
+        const template = getTemplateByKey(costing.type, item.key)
         return await serializeSubElement(
           item,
           template,
@@ -970,14 +1160,14 @@ async function getSubElementsByCostingId(costingId, context = {}) {
 }
 
 async function getSubElementByKey(costingId, key, context = {}) {
-  const costing = await getInitialCosting(costingId)
+  const costing = await getCostingWithSubElements(costingId)
   const costingDisplayData = await getCostingDisplayData(costing)
   await ensureDefaultSubElements(costing.id)
 
-  const template = getTemplateByKey(key)
+  const template = getTemplateByKey(costing.type, key)
 
   if (!template) {
-    throw createHttpError(404, 'Initial Costing sub-element not found.')
+    throw createHttpError(404, `${costing.type} sub-element not found.`)
   }
 
   const item = await RfqCostingInitialSubElement.findOne({
@@ -1011,14 +1201,14 @@ async function getSubElementByKey(costingId, key, context = {}) {
 }
 
 async function updateSubElementByKey(costingId, key, payload = {}) {
-  const costing = await getInitialCosting(costingId)
+  const costing = await getCostingWithSubElements(costingId)
   const costingDisplayData = await getCostingDisplayData(costing)
   await ensureDefaultSubElements(costing.id)
 
-  const template = getTemplateByKey(key)
+  const template = getTemplateByKey(costing.type, key)
 
   if (!template) {
-    throw createHttpError(404, 'Initial Costing sub-element not found.')
+    throw createHttpError(404, `${costing.type} sub-element not found.`)
   }
 
   const item = await RfqCostingInitialSubElement.findOne({
@@ -1046,11 +1236,13 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     RfqCostingInitialSubElement.APPROVAL_STATUS_VALUES,
     APPROVAL_STATUS_ALIASES,
   )
-  const normalizedDesignType = normalizeEnumValue(
-    payload?.design_type ?? payload?.designType,
-    RfqCostingInitialSubElement.DESIGN_TYPE_VALUES,
-    DESIGN_TYPE_ALIASES,
-  )
+  const normalizedDesignType = supportsDesignType(costing.type)
+    ? normalizeEnumValue(
+        payload?.design_type ?? payload?.designType,
+        RfqCostingInitialSubElement.DESIGN_TYPE_VALUES,
+        DESIGN_TYPE_ALIASES,
+      )
+    : ''
 
   if (payload.pilot !== undefined) {
     updateData.pilot = getTrimmedText(payload.pilot) || null
@@ -1084,6 +1276,10 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
   }
 
   if (payload.design_type !== undefined || payload.designType !== undefined) {
+    if (!supportsDesignType(costing.type)) {
+      throw createHttpError(400, 'Design type is available only for Initial Costing.')
+    }
+
     if (!normalizedDesignType) {
       throw createHttpError(400, 'Invalid design type.')
     }
@@ -1106,10 +1302,6 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     )
   }
 
-  if (payload.link !== undefined || payload.url !== undefined || payload.lien !== undefined) {
-    updateData.link = normalizeOptionalLink(payload.link ?? payload.url ?? payload.lien)
-  }
-
 
   const previousApprovalStatus = item.approval_status
   const previousPilot = item.pilot
@@ -1125,7 +1317,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
   const pilotWasAssigned = updateData.pilot !== undefined && updateData.pilot !== previousPilot
 
   if (pilotWasAssigned && updateData.pilot) {
-    ;(async () => {
+    ; (async () => {
       try {
         if (resolvedPilotUser && resolvedPilotUser.email) {
           await emailService.sendPilotAssignmentNotification(
@@ -1156,19 +1348,19 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     const statusIsNotifiable = ['Help!!!', 'Late!', 'Escalation level 1'].includes(updateData.status)
 
     if (statusWasUpdated && statusJustDone) {
-      ;(async () => {
+      ; (async () => {
         try {
           const approvers = await findApproversBySubElementKey(key)
-          
+
           if (approvers && approvers.length > 0) {
             const approvalToken = generateApprovalToken()
             const approvalTokenExpiresAt = getApprovalTokenExpiryDate()
-            
+
             await item.update({
               approval_token: approvalToken,
               approval_token_expires_at: approvalTokenExpiresAt,
             })
-            
+
             for (const approver of approvers) {
               if (approver.email) {
                 await emailService.sendSubElementApprovalRequest(
@@ -1178,7 +1370,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
                   costing.id,
                   template.title,
                   approvalToken,
-                  item.link
+                  costing.link || item.link
                 )
               }
             }
@@ -1191,7 +1383,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
         }
       })()
     } else if (statusWasUpdated && statusIsNotifiable) {
-      ;(async () => {
+      ; (async () => {
         try {
           const approvers = await findApproversBySubElementKey(key)
 
@@ -1223,10 +1415,14 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     console.error('❌ Error in email trigger logic:', error.message)
   }
 
-  const bomSpecCompletedJustDone = key === 'bom-spec-completed' && updateData.status === 'Done' && previousStatus !== 'Done'
+  const bomSpecCompletedJustDone =
+    costing.type === 'Initial Costing' &&
+    key === 'bom-spec-completed' &&
+    updateData.status === 'Done' &&
+    previousStatus !== 'Done'
 
   if (bomSpecCompletedJustDone) {
-    ;(async () => {
+    ; (async () => {
       try {
         await item.reload()
         await notifyPilotsThatSubElementsAreReadyToStart(
@@ -1249,7 +1445,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     previousApprovalStatus !== 'Approved'
 
   if (approvalJustGranted) {
-    ;(async () => {
+    ; (async () => {
       try {
         await item.reload()
         await triggerWorkflowAfterApproval(costing, item)
@@ -1265,11 +1461,11 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     item.status !== 'Done'
 
   if (false && avoAssembly2dJustDone) {
-    ;(async () => {
+    ; (async () => {
       try {
         const targetKeys = getSubElementKeysAfterAvoAssembly2d()
         for (const targetKey of targetKeys) {
-          const template = getTemplateByKey(targetKey)
+          const template = getTemplateByKey(costing.type, targetKey)
           if (!template) {
             console.warn(`Sub-element template not found for key "${targetKey}".`)
             continue
@@ -1300,7 +1496,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     (key === 'technical-feasibility-assessment' || key === 'bom-spec-completed')
 
   if (false && isTechnicalFeasibilityOrBomSpec && updateData.status !== undefined) {
-    ;(async () => {
+    ; (async () => {
       try {
         await item.reload()
 
@@ -1325,7 +1521,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
           const targetKeys = getSubElementKeysAfterTechnicalFeasibilityAndBomSpec()
 
           for (const targetKey of targetKeys) {
-            const template = getTemplateByKey(targetKey)
+            const template = getTemplateByKey(costing.type, targetKey)
             if (!template) {
               console.warn(`Sub-element template not found for key "${targetKey}".`)
               continue
@@ -1348,7 +1544,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
             await notifyManagersThatSubElementWasTriggered(costing, item, subElement)
           }
         } else {
-    
+
         }
       } catch (error) {
         console.error('Error while triggering sub-elements after technical-feasibility and bom-spec:', error.message)
@@ -1361,7 +1557,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     (key === 'bom-cost-ready' || key === 'assembly-cost-line')
 
   if (false && isBomCostOrAssemblyCost && updateData.status !== undefined) {
-    ;(async () => {
+    ; (async () => {
       try {
         await item.reload()
 
@@ -1386,7 +1582,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
           const targetKeys = getSubElementKeyAfterBomCostAndAssemblyCost()
 
           for (const targetKey of targetKeys) {
-            const template = getTemplateByKey(targetKey)
+            const template = getTemplateByKey(costing.type, targetKey)
             if (!template) {
               console.warn(`Sub-element template not found for key "${targetKey}".`)
               continue
@@ -1408,7 +1604,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
             await notifyManagersThatSubElementWasTriggered(costing, item, subElement)
           }
         } else {
-       
+
         }
       } catch (error) {
         console.error('Error while triggering final step after bom-cost and assembly-cost:', error.message)
@@ -1421,91 +1617,91 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     const designType = updateData.design_type || item.design_type
     const costingDisplayData = await getCostingDisplayData(costing)
 
-    ;(async () => {
-      try {
-        if (designType === 'AVO Design') {
-          const secondSubElement = await RfqCostingInitialSubElement.findOne({
-            where: {
-              rfq_costing_id: costing.id,
-              key: 'technical-feasibility-assessment',
-            },
-          })
-
-          if (secondSubElement) {
-            await secondSubElement.update({
-              title: 'AVO Design owner : assembly 2D is available for customer communication',
+      ; (async () => {
+        try {
+          if (designType === 'AVO Design') {
+            const secondSubElement = await RfqCostingInitialSubElement.findOne({
+              where: {
+                rfq_costing_id: costing.id,
+                key: 'technical-feasibility-assessment',
+              },
             })
 
-            const managers = await findApproversBySubElementKey('technical-feasibility-assessment')
-            const pilotName = secondSubElement.pilot || item.pilot || 'Not assigned'
+            if (secondSubElement) {
+              await secondSubElement.update({
+                title: 'AVO Design owner : assembly 2D is available for customer communication',
+              })
 
-            for (const manager of managers) {
-              if (manager.email) {
-                await emailService.sendSubElementOpeningNotification(
-                  manager.email,
-                  pilotName,
-                  costingDisplayData,
-                  costing.id || 'N/A',
-                  'AVO Design owner : assembly 2D is available for customer communication',
-                )
+              const managers = await findApproversBySubElementKey('technical-feasibility-assessment')
+              const pilotName = secondSubElement.pilot || item.pilot || 'Not assigned'
+
+              for (const manager of managers) {
+                if (manager.email) {
+                  await emailService.sendSubElementOpeningNotification(
+                    manager.email,
+                    pilotName,
+                    costingDisplayData,
+                    costing.id || 'N/A',
+                    'AVO Design owner : assembly 2D is available for customer communication',
+                  )
+                }
+              }
+            }
+          } else if (designType === 'Customer Design') {
+            const secondSubElement = await RfqCostingInitialSubElement.findOne({
+              where: {
+                rfq_costing_id: costing.id,
+                key: 'technical-feasibility-assessment',
+              },
+            })
+
+            const thirdSubElement = await RfqCostingInitialSubElement.findOne({
+              where: {
+                rfq_costing_id: costing.id,
+                key: 'bom-spec-completed',
+              },
+            })
+
+            if (secondSubElement) {
+              const managers = await findApproversBySubElementKey('technical-feasibility-assessment')
+              const pilotName = secondSubElement.pilot || item.pilot || 'Not assigned'
+              for (const manager of managers) {
+                if (manager.email) {
+                  await emailService.sendSubElementOpeningNotification(
+                    manager.email,
+                    pilotName,
+                    costingDisplayData,
+                    costing.id || 'N/A',
+                    'Technical feasibility assessment is available for customer communication',
+                  )
+                }
+              }
+            }
+
+            if (thirdSubElement) {
+              const managers = await findApproversBySubElementKey('bom-spec-completed')
+              const pilotName = thirdSubElement.pilot || item.pilot || 'Not assigned'
+              for (const manager of managers) {
+                if (manager.email) {
+                  await emailService.sendSubElementOpeningNotification(
+                    manager.email,
+                    pilotName,
+                    costingDisplayData,
+                    costing.id || 'N/A',
+                    'BoM and spec are correctly completed inside the costing file',
+                  )
+                }
               }
             }
           }
-        } else if (designType === 'Customer Design') {
-          const secondSubElement = await RfqCostingInitialSubElement.findOne({
-            where: {
-              rfq_costing_id: costing.id,
-              key: 'technical-feasibility-assessment',
-            },
-          })
-
-          const thirdSubElement = await RfqCostingInitialSubElement.findOne({
-            where: {
-              rfq_costing_id: costing.id,
-              key: 'bom-spec-completed',
-            },
-          })
-
-          if (secondSubElement) {
-            const managers = await findApproversBySubElementKey('technical-feasibility-assessment')
-            const pilotName = secondSubElement.pilot || item.pilot || 'Not assigned'
-            for (const manager of managers) {
-              if (manager.email) {
-                await emailService.sendSubElementOpeningNotification(
-                  manager.email,
-                  pilotName,
-                  costingDisplayData,
-                  costing.id || 'N/A',
-                  'Technical feasibility assessment is available for customer communication',
-                )
-              }
-            }
-          }
-
-          if (thirdSubElement) {
-            const managers = await findApproversBySubElementKey('bom-spec-completed')
-            const pilotName = thirdSubElement.pilot || item.pilot || 'Not assigned'
-            for (const manager of managers) {
-              if (manager.email) {
-                await emailService.sendSubElementOpeningNotification(
-                  manager.email,
-                  pilotName,
-                  costingDisplayData,
-                  costing.id || 'N/A',
-                  'BoM and spec are correctly completed inside the costing file',
-                )
-              }
-            }
-          }
+        } catch (error) {
+          console.error('❌ Error in conditional logic:', error.message)
         }
-      } catch (error) {
-        console.error('❌ Error in conditional logic:', error.message)
-      }
-    })()
+      })()
   }
 
   return {
-    message: 'Initial Costing sub-element updated successfully.',
+    message: 'Costing sub-element updated successfully.',
     costing_id: costing.id,
     rfq_id: costing.rfq_id,
     project_display_name: costingDisplayData.project_display_name,
@@ -1546,7 +1742,7 @@ async function getSubElementByApprovalToken(token, context = {}) {
     throw createHttpError(404, 'Associated RFQ Costing not found.')
   }
 
-  const template = getTemplateByKey(item.key)
+  const template = getTemplateByKey(costing.type, item.key)
 
   if (!template) {
     throw createHttpError(404, 'Sub-element template not found.')
@@ -1570,7 +1766,7 @@ async function getSubElementByApprovalToken(token, context = {}) {
       approval_status: item.approval_status,
       duration: item.duration,
       due_date: item.due_date,
-      link: item.link,
+      link: costingDisplayData.costing_link || item.link || null,
       design_type: item.design_type,
       rfq_id: costingDisplayData.rfq_id,
       project_display_name: costingDisplayData.project_display_name,
@@ -1605,7 +1801,7 @@ async function approveSubElementByToken(token, payload = {}) {
     throw createHttpError(404, 'Associated RFQ Costing not found.')
   }
 
-  const template = getTemplateByKey(item.key)
+  const template = getTemplateByKey(costing.type, item.key)
 
   const costingDisplayData = await getCostingDisplayData(costing)
 
@@ -1623,27 +1819,37 @@ async function approveSubElementByToken(token, payload = {}) {
     throw createHttpError(400, 'Invalid approval status.')
   }
 
-  const normalizedDesignType = normalizeEnumValue(
-    payload?.design_type ?? payload?.designType,
-    RfqCostingInitialSubElement.DESIGN_TYPE_VALUES,
-    DESIGN_TYPE_ALIASES,
-  )
+  const normalizedDesignType = supportsDesignType(costing.type)
+    ? normalizeEnumValue(
+        payload?.design_type ?? payload?.designType,
+        RfqCostingInitialSubElement.DESIGN_TYPE_VALUES,
+        DESIGN_TYPE_ALIASES,
+      )
+    : ''
 
   const previousApprovalStatus = item.approval_status
 
   const updateData = {
     approval_status: normalizedApprovalStatus,
-    approval_token: null, 
+    approval_token: null,
     approval_token_expires_at: null,
   }
 
-  if (normalizedDesignType) {
+  if (payload?.design_type !== undefined || payload?.designType !== undefined) {
+    if (!supportsDesignType(costing.type)) {
+      throw createHttpError(400, 'Design type is available only for Initial Costing.')
+    }
+
+    if (!normalizedDesignType) {
+      throw createHttpError(400, 'Invalid design type.')
+    }
+
     updateData.design_type = normalizedDesignType
   }
 
   if (normalizedApprovalStatus === 'Not approved') {
     updateData.status = 'In progress'
-    
+
   }
 
   await item.update(updateData)
@@ -1655,7 +1861,7 @@ async function approveSubElementByToken(token, payload = {}) {
     previousApprovalStatus !== 'Approved'
 
   if (approvalJustGranted) {
-    ;(async () => {
+    ; (async () => {
       try {
         await triggerWorkflowAfterApproval(costing, item)
       } catch (error) {
@@ -1681,7 +1887,7 @@ async function approveSubElementByToken(token, payload = {}) {
       approval_status: item.approval_status,
       duration: item.duration,
       due_date: item.due_date,
-      link: item.link,
+      link: costingDisplayData.costing_link || item.link || null,
       design_type: item.design_type,
       rfq_id: costingDisplayData.rfq_id,
       project_display_name: costingDisplayData.project_display_name,

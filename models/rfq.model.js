@@ -14,6 +14,15 @@ const Rfq = sequelize.define(
       allowNull: false,
       defaultValue: {},
     },
+    is_archived: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
+    archived_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
   },
   {
     tableName: 'rfq',

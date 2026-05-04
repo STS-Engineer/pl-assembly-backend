@@ -15,6 +15,7 @@ const PLANT_VALUES = [
   'Frankfurt',
   'Poitiers',
   'Tianjin',
+  'Kunshan',
 ]
 
 const DEFAULT_PILOT_PLACEHOLDER = 'Pilot name'
@@ -77,11 +78,42 @@ function getPilotDisplayValue(user = {}) {
   return getTrimmedText(user.full_name) || getTrimmedText(user.email) || DEFAULT_PILOT_PLACEHOLDER
 }
 
-function getInitialSubElementTemplate(key) {
-  const normalizedKey = getTrimmedText(key)
-  return (
-    RfqCostingInitialSubElement.TEMPLATES.find((template) => template.key === normalizedKey) || null
+function getCostingSubElementTemplate(costingType, key) {
+  return RfqCostingInitialSubElement.getTemplateByKey(costingType, getTrimmedText(key))
+}
+
+function supportsCostingSubElements(costingType) {
+  return RfqCostingInitialSubElement.SUPPORTED_COSTING_TYPES.includes(getTrimmedText(costingType))
+}
+
+function supportsCostingLink(costingType) {
+  const normalizedCostingType = getTrimmedText(costingType)
+  return ['Initial Costing', 'Improved Costing', 'Last Call Costing'].includes(
+    normalizedCostingType,
   )
+}
+
+function hasOwnField(payload, fieldName) {
+  return Boolean(payload) && Object.prototype.hasOwnProperty.call(payload, fieldName)
+}
+
+function getNormalizedCostingProductFamily(payload = {}) {
+  return getTrimmedText(payload?.product_family ?? payload?.productFamily)
+}
+
+function buildDefaultSubElementsPayloadForCostingType(costingType) {
+  if (!supportsCostingSubElements(costingType)) {
+    return []
+  }
+
+  return RfqCostingInitialSubElement.getTemplatesForCostingType(costingType).map((template) => ({
+    key: template.key,
+    title: template.title,
+    pilot: template.defaultPilot || DEFAULT_PILOT_PLACEHOLDER,
+    approver: template.defaultApprover || null,
+    status: template.defaultStatus || 'To be planned',
+    approval_status: template.defaultApprovalStatus || 'Not requested',
+  }))
 }
 
 async function resolvePilotUserByValue(pilotValue) {
@@ -219,7 +251,7 @@ async function notifyPilotsThatBomSpecIsDone(
   const costingDisplayData = await getCostingDisplayData(costing)
 
   for (const targetKey of targetKeys) {
-    const template = getInitialSubElementTemplate(targetKey)
+    const template = getCostingSubElementTemplate(costing.type, targetKey)
 
     if (!template) {
       continue
@@ -317,16 +349,6 @@ function buildInitialSubElementUpdateData(subElementPayload = {}) {
   }
 
   if (
-    subElementPayload.link !== undefined ||
-    subElementPayload.url !== undefined ||
-    subElementPayload.lien !== undefined
-  ) {
-    updateData.link = normalizeOptionalText(
-      subElementPayload.link ?? subElementPayload.url ?? subElementPayload.lien,
-    )
-  }
-
-  if (
     subElementPayload.design_type !== undefined ||
     subElementPayload.designType !== undefined
   ) {
@@ -339,7 +361,7 @@ function buildInitialSubElementUpdateData(subElementPayload = {}) {
 }
 
 async function syncInitialSubElements(costing, subElementsPayload = []) {
-  if (costing.type !== 'Initial Costing') {
+  if (!supportsCostingSubElements(costing.type)) {
     return
   }
 
@@ -354,7 +376,7 @@ async function syncInitialSubElements(costing, subElementsPayload = []) {
       throw createHttpError(400, 'Each sub-element requires a key.')
     }
 
-    const template = getInitialSubElementTemplate(key)
+    const template = getCostingSubElementTemplate(costing.type, key)
     const existingSubElement = await RfqCostingInitialSubElement.findOne({
       where: {
         rfq_costing_id: costing.id,
@@ -392,7 +414,12 @@ async function syncInitialSubElements(costing, subElementsPayload = []) {
 
       const nextStatus = updateData.status ?? previousStatus ?? template?.defaultStatus ?? 'To be planned'
 
-      if (key === 'bom-spec-completed' && nextStatus === 'Done' && previousStatus !== 'Done') {
+      if (
+        costing.type === 'Initial Costing' &&
+        key === 'bom-spec-completed' &&
+        nextStatus === 'Done' &&
+        previousStatus !== 'Done'
+      ) {
         deferredPilotReadyNotifications.push({
           completedSubElementTitle,
         })
@@ -416,13 +443,16 @@ async function syncInitialSubElements(costing, subElementsPayload = []) {
       due_date: Object.prototype.hasOwnProperty.call(updateData, 'due_date')
         ? updateData.due_date
         : null,
-      link: Object.prototype.hasOwnProperty.call(updateData, 'link') ? updateData.link : null,
       design_type: Object.prototype.hasOwnProperty.call(updateData, 'design_type')
         ? updateData.design_type
         : null,
     })
 
-    if (key === 'bom-spec-completed' && createdSubElement.status === 'Done') {
+    if (
+      costing.type === 'Initial Costing' &&
+      key === 'bom-spec-completed' &&
+      createdSubElement.status === 'Done'
+    ) {
       deferredPilotReadyNotifications.push({
         completedSubElementTitle: createdSubElement.title || template?.title || key,
       })
@@ -514,8 +544,9 @@ async function createRfqCosting(payload) {
   const normalizedRfqId = getTrimmedText(payload?.rfq_id)
   const normalizedType = getTrimmedText(payload?.type)
   const normalizedReference = getTrimmedText(payload?.reference)
-  const normalizedProductFamily = getTrimmedText(payload?.product_family)
+  const normalizedProductFamily = getNormalizedCostingProductFamily(payload)
   const normalizedPlant = getTrimmedText(payload?.plant)
+  const normalizedLink = normalizeOptionalText(payload?.link ?? payload?.url ?? payload?.lien)
 
   if (!normalizedRfqId) {
     throw createHttpError(400, 'RFQ identifier is required.')
@@ -560,6 +591,7 @@ async function createRfqCosting(payload) {
     reference: normalizedReference,
     product_family: normalizedProductFamily || 'TBD',
     plant: normalizedPlant,
+    link: supportsCostingLink(normalizedType) ? normalizedLink : null,
   })
 
   const subElementsPayload = Array.isArray(payload?.sub_elements)
@@ -570,6 +602,8 @@ async function createRfqCosting(payload) {
 
   if (subElementsPayload.length > 0) {
     await syncInitialSubElements(costing, subElementsPayload)
+  } else if (supportsCostingSubElements(costing.type)) {
+    await syncInitialSubElements(costing, buildDefaultSubElementsPayloadForCostingType(costing.type))
   }
 
   return costing
@@ -584,14 +618,20 @@ async function updateRfqCosting(id, payload) {
 
   const normalizedType = getTrimmedText(payload?.type)
   const normalizedReference = getTrimmedText(payload?.reference)
-  const normalizedProductFamily = getTrimmedText(payload?.product_family)
+  const normalizedProductFamily = getNormalizedCostingProductFamily(payload)
   const normalizedPlant = getTrimmedText(payload?.plant)
+  const normalizedLink = normalizeOptionalText(payload?.link ?? payload?.url ?? payload?.lien)
+  const hasProductFamilyInput =
+    hasOwnField(payload, 'product_family') || hasOwnField(payload, 'productFamily')
 
   if (payload.type && !RfqCosting.COSTING_TYPE_VALUES.includes(normalizedType)) {
     throw createHttpError(400, 'Invalid costing type.')
   }
 
-  if (payload.product_family && !RfqCosting.PRODUCT_FAMILY_VALUES.includes(normalizedProductFamily)) {
+  if (
+    hasProductFamilyInput &&
+    !RfqCosting.PRODUCT_FAMILY_VALUES.includes(normalizedProductFamily)
+  ) {
     throw createHttpError(400, 'Invalid product family.')
   }
 
@@ -613,11 +653,17 @@ async function updateRfqCosting(id, payload) {
     }
   }
 
+  const nextCostingType = payload.type !== undefined ? normalizedType : costing.type
   const updateData = {}
   if (payload.type !== undefined) updateData.type = normalizedType
   if (payload.reference !== undefined) updateData.reference = normalizedReference
-  if (payload.product_family !== undefined) updateData.product_family = normalizedProductFamily
+  if (hasProductFamilyInput) updateData.product_family = normalizedProductFamily
   if (payload.plant !== undefined) updateData.plant = normalizedPlant
+  if (payload.link !== undefined || payload.url !== undefined || payload.lien !== undefined) {
+    updateData.link = supportsCostingLink(nextCostingType) ? normalizedLink : null
+  } else if (payload.type !== undefined && !supportsCostingLink(nextCostingType)) {
+    updateData.link = null
+  }
 
   await costing.update(updateData)
 
@@ -629,6 +675,11 @@ async function updateRfqCosting(id, payload) {
 
   if (subElementsPayload) {
     await syncInitialSubElements(costing, subElementsPayload)
+  } else if (supportsCostingSubElements(nextCostingType)) {
+    await syncInitialSubElements(
+      costing,
+      buildDefaultSubElementsPayloadForCostingType(nextCostingType),
+    )
   }
 
   return costing.reload()

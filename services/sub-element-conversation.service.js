@@ -169,13 +169,12 @@ function isAdminUser(user = {}) {
   return getLookupValue(user?.role) === 'admin'
 }
 
-function getTemplateByKey(key) {
-  const normalizedKey = getTrimmedText(key)
-  return RfqCostingInitialSubElement.TEMPLATES.find((template) => template.key === normalizedKey) || null
+function getTemplateByKey(costingType, key) {
+  return RfqCostingInitialSubElement.getTemplateByKey(costingType, getTrimmedText(key))
 }
 
-async function getInitialCosting(costingId) {
-  debugConversationLog('[getInitialCosting] Validating costing...', { costingId })
+async function getSupportedCosting(costingId) {
+  debugConversationLog('[getSupportedCosting] Validating costing...', { costingId })
 
   const normalizedCostingId = Number.parseInt(String(costingId || '').trim(), 10)
 
@@ -197,16 +196,16 @@ async function getInitialCosting(costingId) {
     throw createHttpError(404, `RFQ Costing with ID ${normalizedCostingId} not found.`)
   }
 
-  debugConversationLog('[getInitialCosting] Costing found:', {
+  debugConversationLog('[getSupportedCosting] Costing found:', {
     id: costing.id,
     type: costing.type,
     rfq_id: costing.rfq_id,
   })
 
-  if (costing.type !== 'Initial Costing') {
+  if (!RfqCostingInitialSubElement.SUPPORTED_COSTING_TYPES.includes(costing.type)) {
     throw createHttpError(
       400,
-      `Conversation is available only for Initial Costing steps. Found: ${costing.type}`,
+      `Conversation is available only for supported costing steps. Found: ${costing.type}`,
     )
   }
 
@@ -267,20 +266,23 @@ async function getCachedCostingDisplayData(costing) {
 async function getConversationContext(costingId, key) {
   debugConversationLog('[getConversationContext] Starting...', { costingId, key })
 
-  const costing = await getInitialCosting(costingId)
-  const template = getTemplateByKey(key)
+  const costing = await getSupportedCosting(costingId)
+  const template = getTemplateByKey(costing.type, key)
+  const availableTemplates = RfqCostingInitialSubElement.getTemplatesForCostingType(costing.type)
 
   debugConversationLog('[getConversationContext] Template lookup:', {
     requestedKey: key,
     found: !!template,
     templateKey: template?.key,
-    availableTemplates: RfqCostingInitialSubElement.TEMPLATES.map((t) => t.key),
+    availableTemplates: availableTemplates.map((candidateTemplate) => candidateTemplate.key),
   })
 
   if (!template) {
     throw createHttpError(
       404,
-      `Initial Costing step "${key}" not found. Available steps: ${RfqCostingInitialSubElement.TEMPLATES.map((t) => t.key).join(', ')}`,
+      `${costing.type} step "${key}" not found. Available steps: ${availableTemplates
+        .map((candidateTemplate) => candidateTemplate.key)
+        .join(', ')}`,
     )
   }
 
@@ -586,12 +588,12 @@ async function resolveConversationParticipants(subElement, template, conversatio
 
   addParticipant(participantsByKey, resolveUserReference(subElement?.pilot, users), 'pilot')
   addParticipant(participantsByKey, resolveUserReference(subElement?.approver, users), 'approver')
-  ;(Array.isArray(conversationItems) ? conversationItems : []).forEach((item) => {
-    const rawItem = item && typeof item.toJSON === 'function' ? item.toJSON() : item || {}
-    normalizeStoredMentions(rawItem.mentions).forEach((mentionedUser) => {
-      addParticipantRecord(participantsByKey, mentionedUser, 'mentioned')
+    ; (Array.isArray(conversationItems) ? conversationItems : []).forEach((item) => {
+      const rawItem = item && typeof item.toJSON === 'function' ? item.toJSON() : item || {}
+      normalizeStoredMentions(rawItem.mentions).forEach((mentionedUser) => {
+        addParticipantRecord(participantsByKey, mentionedUser, 'mentioned')
+      })
     })
-  })
 
   return Array.from(participantsByKey.values()).sort((leftParticipant, rightParticipant) => {
     const leftLabel =
@@ -824,12 +826,12 @@ async function serializeConversationMessages(items) {
   )
   const authors = authorIds.length
     ? await User.findAll({
-        where: {
-          id: authorIds,
-        },
-        attributes: ['id', 'full_name', 'email', 'role'],
-        raw: true,
-      })
+      where: {
+        id: authorIds,
+      },
+      attributes: ['id', 'full_name', 'email', 'role'],
+      raw: true,
+    })
     : []
   const authorsById = new Map(authors.map((author) => [author.id, author]))
 

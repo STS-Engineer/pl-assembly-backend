@@ -54,6 +54,10 @@ const RfqCosting = sequelize.define(
       type: DataTypes.STRING,
       allowNull: true,
     },
+    link: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
   },
   {
     tableName: 'rfq_costing',

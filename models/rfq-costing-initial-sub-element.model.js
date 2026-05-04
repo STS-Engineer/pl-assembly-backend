@@ -1,111 +1,16 @@
 const { DataTypes } = require('sequelize')
 const sequelize = require('../config/sequelize')
-
-const INITIAL_SUB_ELEMENT_STATUS_VALUES = [
-  'To be planned',
-  'Not requested',
-  'Ready to start',
-  'Escalation level 1',
-  'In progress',
-  'Late!',
-  'Done',
-  'Question to PM',
-  'Question to sales',
-  'Question to PL',
-  'Help!!!',
-]
-
-const INITIAL_SUB_ELEMENT_APPROVAL_STATUS_VALUES = [
-  'Not requested',
-  'Approved',
-  'Not approved',
-  'To be approved',
-  'Ready for app',
-  'Need to be reworked',
-]
-
-const INITIAL_SUB_ELEMENT_ROLE_VALUES = ['pilot', 'manager', 'admin', 'pm', 'sales', 'pl', 'user']
-const INITIAL_SUB_ELEMENT_DESIGN_TYPE_VALUES = ['Customer Design', 'AVO Design']
-
-const INITIAL_SUB_ELEMENT_TEMPLATES = [
-  {
-    key: 'needed-data-understood',
-    title: 'All needed data are available and understood',
-    pilotLabel: 'Pilot',
-    approverLabel: 'Esc level 1 / Approver',
-    approverRole: 'manager',
-    fillRoles: ['pilot', 'manager', 'admin'],
-    viewRoles: ['pilot', 'manager', 'admin', 'pm', 'sales', 'pl', 'user'],
-    defaultStatus: 'To be planned',
-    defaultApprovalStatus: 'Not requested',
-  },
-  {
-    key: 'technical-feasibility-assessment',
-    title: 'Technical feasibility assessment is available for customer communication',
-    pilotLabel: 'Pilot',
-    approverLabel: 'Esc level 1 / Approver',
-    approverRole: 'manager',
-    fillRoles: ['pilot', 'manager', 'admin'],
-    viewRoles: ['pilot', 'manager', 'admin', 'pm', 'sales', 'pl', 'user'],
-    defaultStatus: 'To be planned',
-    defaultApprovalStatus: 'Not requested',
-  },
-  {
-    key: 'bom-spec-completed',
-    title: 'BoM and spec are correctly completed inside the costing file',
-    pilotLabel: 'Pilot',
-    approverLabel: 'Esc level 1 / Approver',
-    approverRole: 'manager',
-    fillRoles: ['pilot', 'manager', 'admin'],
-    viewRoles: ['pilot', 'manager', 'admin', 'pm', 'sales', 'pl', 'user'],
-    defaultStatus: 'To be planned',
-    defaultApprovalStatus: 'Not requested',
-  },
-  {
-    key: 'avo-design-assembly-2d',
-    title: 'AVO Design owner : assembly 2D is available for customer communication',
-    pilotLabel: 'Pilot',
-    approverLabel: 'Esc level 1 / Approver',
-    approverRole: 'manager',
-    fillRoles: ['pilot', 'manager', 'admin'],
-    viewRoles: ['pilot', 'manager', 'admin', 'pm', 'sales', 'pl', 'user'],
-    defaultStatus: 'To be planned',
-    defaultApprovalStatus: 'Not requested',
-  },
-  {
-    key: 'bom-cost-ready',
-    title: 'BoM cost is ready for costing calculation (estimated at 60% max)',
-    pilotLabel: 'Pilot',
-    approverLabel: 'Esc level 1 / Approver',
-    approverRole: 'manager',
-    fillRoles: ['pilot', 'manager', 'admin'],
-    viewRoles: ['pilot', 'manager', 'admin', 'pm', 'sales', 'pl', 'user'],
-    defaultStatus: 'To be planned',
-    defaultApprovalStatus: 'Not requested',
-  },
-  {
-    key: 'assembly-cost-line',
-    title: 'Assembly cost and line are available inside the costing file (estimated at max 60%)',
-    pilotLabel: 'Pilot',
-    approverLabel: 'Esc level 1 / Approver',
-    approverRole: 'manager',
-    fillRoles: ['pilot', 'manager', 'admin'],
-    viewRoles: ['pilot', 'manager', 'admin', 'pm', 'sales', 'pl', 'user'],
-    defaultStatus: 'To be planned',
-    defaultApprovalStatus: 'Not requested',
-  },
-  {
-    key: 'costing-file-reviewed',
-    title: 'Costing file is reviewed and approved with N+1',
-    pilotLabel: 'Pilot',
-    approverLabel: 'Esc level 1 / Approver',
-    approverRole: 'manager',
-    fillRoles: ['pilot', 'manager', 'admin'],
-    viewRoles: ['pilot', 'manager', 'admin', 'pm', 'sales', 'pl', 'user'],
-    defaultStatus: 'To be planned',
-    defaultApprovalStatus: 'Not requested',
-  },
-]
+const {
+  APPROVAL_STATUS_VALUES,
+  DESIGN_TYPE_VALUES,
+  ROLE_VALUES,
+  STATUS_VALUES,
+  SUPPORTED_COSTING_TYPES,
+  TEMPLATES_BY_COSTING_TYPE,
+  getAllTemplates,
+  getTemplateByKey,
+  getTemplatesForCostingType,
+} = require('./rfq-costing-sub-element.config')
 
 const RfqCostingInitialSubElement = sequelize.define(
   'RfqCostingInitialSubElement',
@@ -142,12 +47,12 @@ const RfqCostingInitialSubElement = sequelize.define(
       allowNull: true,
     },
     status: {
-      type: DataTypes.ENUM(...INITIAL_SUB_ELEMENT_STATUS_VALUES),
+      type: DataTypes.ENUM(...STATUS_VALUES),
       allowNull: false,
       defaultValue: 'To be planned',
     },
     approval_status: {
-      type: DataTypes.ENUM(...INITIAL_SUB_ELEMENT_APPROVAL_STATUS_VALUES),
+      type: DataTypes.ENUM(...APPROVAL_STATUS_VALUES),
       allowNull: false,
       defaultValue: 'Not requested',
     },
@@ -173,7 +78,7 @@ const RfqCostingInitialSubElement = sequelize.define(
       allowNull: true,
     },
     design_type: {
-      type: DataTypes.ENUM(...INITIAL_SUB_ELEMENT_DESIGN_TYPE_VALUES),
+      type: DataTypes.ENUM(...DESIGN_TYPE_VALUES),
       allowNull: true,
     },
   },
@@ -196,10 +101,14 @@ const RfqCostingInitialSubElement = sequelize.define(
   },
 )
 
-RfqCostingInitialSubElement.STATUS_VALUES = INITIAL_SUB_ELEMENT_STATUS_VALUES
-RfqCostingInitialSubElement.APPROVAL_STATUS_VALUES = INITIAL_SUB_ELEMENT_APPROVAL_STATUS_VALUES
-RfqCostingInitialSubElement.ROLE_VALUES = INITIAL_SUB_ELEMENT_ROLE_VALUES
-RfqCostingInitialSubElement.DESIGN_TYPE_VALUES = INITIAL_SUB_ELEMENT_DESIGN_TYPE_VALUES
-RfqCostingInitialSubElement.TEMPLATES = INITIAL_SUB_ELEMENT_TEMPLATES
+RfqCostingInitialSubElement.STATUS_VALUES = STATUS_VALUES
+RfqCostingInitialSubElement.APPROVAL_STATUS_VALUES = APPROVAL_STATUS_VALUES
+RfqCostingInitialSubElement.ROLE_VALUES = ROLE_VALUES
+RfqCostingInitialSubElement.DESIGN_TYPE_VALUES = DESIGN_TYPE_VALUES
+RfqCostingInitialSubElement.SUPPORTED_COSTING_TYPES = SUPPORTED_COSTING_TYPES
+RfqCostingInitialSubElement.TEMPLATES_BY_COSTING_TYPE = TEMPLATES_BY_COSTING_TYPE
+RfqCostingInitialSubElement.TEMPLATES = getAllTemplates()
+RfqCostingInitialSubElement.getTemplateByKey = getTemplateByKey
+RfqCostingInitialSubElement.getTemplatesForCostingType = getTemplatesForCostingType
 
 module.exports = RfqCostingInitialSubElement
