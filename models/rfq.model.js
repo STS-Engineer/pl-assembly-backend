@@ -23,6 +23,10 @@ const Rfq = sequelize.define(
       type: DataTypes.DATE,
       allowNull: true,
     },
+    created_by_email: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
   },
   {
     tableName: 'rfq',

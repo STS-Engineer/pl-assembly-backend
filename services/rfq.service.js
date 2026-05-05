@@ -1,6 +1,7 @@
 const { Op } = require('sequelize')
 const Rfq = require('../models/rfq.model')
 const RfqCosting = require('../models/rfq-costing.model')
+const SalesRep = require('../models/sales_reps')
 
 const PLANT_VALUES = [
   'Monterry',
@@ -35,6 +36,38 @@ function normalizeBooleanFlag(value, fallback = false) {
 
 function getTrimmedText(value) {
   return String(value || '').trim()
+}
+
+function normalizeOptionalEmail(value) {
+  return getTrimmedText(value).toLowerCase() || null
+}
+
+function serializeSalesRep(salesRep) {
+  const rawSalesRep =
+    salesRep && typeof salesRep.toJSON === 'function' ? salesRep.toJSON() : salesRep || {}
+
+  return {
+    id: rawSalesRep.id ?? null,
+    full_name: getTrimmedText(rawSalesRep.full_name) || null,
+    fullName: getTrimmedText(rawSalesRep.full_name) || null,
+    email: normalizeOptionalEmail(rawSalesRep.email),
+    dept: getTrimmedText(rawSalesRep.dept) || null,
+    localisation: getTrimmedText(rawSalesRep.localisation) || null,
+    region: getTrimmedText(rawSalesRep.region) || null,
+    attached_plant: getTrimmedText(rawSalesRep.attached_plant) || null,
+  }
+}
+
+function buildSalesRepLookupMap(salesReps = []) {
+  return (Array.isArray(salesReps) ? salesReps : []).reduce((lookupMap, salesRep) => {
+    const normalizedSalesRep = serializeSalesRep(salesRep)
+
+    if (normalizedSalesRep.email) {
+      lookupMap.set(normalizedSalesRep.email, normalizedSalesRep)
+    }
+
+    return lookupMap
+  }, new Map())
 }
 
 function normalizeOptionalLink(value) {
@@ -101,11 +134,20 @@ function serializeRfqCosting(costing) {
   }
 }
 
-function serializeRfq(rfq) {
+function serializeRfq(rfq, salesRepsByEmail = null) {
   const rawRfq = rfq && typeof rfq.toJSON === 'function' ? rfq.toJSON() : rfq || {}
+  const normalizedCommercialEmail = normalizeOptionalEmail(rawRfq.created_by_email)
+  const matchedSalesRep =
+    salesRepsByEmail instanceof Map && normalizedCommercialEmail
+      ? salesRepsByEmail.get(normalizedCommercialEmail) || null
+      : null
 
   return {
     ...rawRfq,
+    created_by_email: normalizedCommercialEmail,
+    createdByEmail: normalizedCommercialEmail,
+    commercial_name: matchedSalesRep?.full_name || null,
+    commercialName: matchedSalesRep?.full_name || null,
     is_archived: Boolean(rawRfq.is_archived),
     isArchived: Boolean(rawRfq.is_archived),
     archived_at: rawRfq.archived_at ?? null,
@@ -146,32 +188,79 @@ function buildRfqArchiveWhereClause(options = {}) {
   }
 }
 
-async function getAllRfqs(options = {}) {
-  const rfqs = await Rfq.findAll({
-    where: buildRfqArchiveWhereClause(options),
-    include: [
-      {
-        model: RfqCosting,
-        as: 'costings',
-        required: false,
+async function getSalesRepOptions() {
+  const salesReps = await SalesRep.findAll({
+    attributes: ['id', 'dept', 'full_name', 'email', 'localisation', 'region', 'attached_plant'],
+    where: {
+      email: {
+        [Op.not]: null,
       },
-    ],
+    },
     order: [
-      ['createdAt', 'DESC'],
-      ['rfq_id', 'ASC'],
-      [{ model: RfqCosting, as: 'costings' }, 'createdAt', 'ASC'],
-      [{ model: RfqCosting, as: 'costings' }, 'id', 'ASC'],
+      ['full_name', 'ASC'],
+      ['email', 'ASC'],
     ],
   })
 
-  return rfqs.map(serializeRfq)
+  return salesReps
+    .map((salesRep) => serializeSalesRep(salesRep))
+    .filter((salesRep) => salesRep.email)
+}
+
+async function getAllRfqs(options = {}) {
+  const [rfqs, salesReps] = await Promise.all([
+    Rfq.findAll({
+      where: buildRfqArchiveWhereClause(options),
+      include: [
+        {
+          model: RfqCosting,
+          as: 'costings',
+          required: false,
+        },
+      ],
+      order: [
+        ['createdAt', 'DESC'],
+        ['rfq_id', 'ASC'],
+        [{ model: RfqCosting, as: 'costings' }, 'createdAt', 'ASC'],
+        [{ model: RfqCosting, as: 'costings' }, 'id', 'ASC'],
+      ],
+    }),
+    getSalesRepOptions(),
+  ])
+  const salesRepsByEmail = buildSalesRepLookupMap(salesReps)
+
+  return rfqs.map((rfq) => serializeRfq(rfq, salesRepsByEmail))
 }
 
 async function createRfq(payload) {
   const normalizedRfqId = getTrimmedText(payload?.rfq_id)
+  const normalizedCommercialEmail = normalizeOptionalEmail(
+    payload?.created_by_email ??
+      payload?.createdByEmail ??
+      payload?.commercial ??
+      payload?.rfq_data?.created_by_email ??
+      payload?.rfq_data?.commercial,
+  )
 
   if (!normalizedRfqId) {
     throw createHttpError(400, 'RFQ identifier is required.')
+  }
+
+  if (!normalizedCommercialEmail) {
+    throw createHttpError(400, 'Commercial email is required.')
+  }
+
+  const matchingSalesRep = await SalesRep.findOne({
+    where: {
+      email: {
+        [Op.iLike]: normalizedCommercialEmail,
+      },
+    },
+    attributes: ['id', 'email', 'full_name'],
+  })
+
+  if (!matchingSalesRep) {
+    throw createHttpError(400, 'Selected commercial was not found.')
   }
 
   const existingRfq = await Rfq.findByPk(normalizedRfqId)
@@ -183,6 +272,7 @@ async function createRfq(payload) {
   const rfq = await Rfq.create({
     rfq_id: normalizedRfqId,
     rfq_data: normalizeRfqData(normalizedRfqId, payload?.rfq_data),
+    created_by_email: normalizedCommercialEmail,
     is_archived: false,
     archived_at: null,
   })
@@ -190,7 +280,7 @@ async function createRfq(payload) {
   return serializeRfq({
     ...rfq.toJSON(),
     costings: [],
-  })
+  }, buildSalesRepLookupMap([matchingSalesRep]))
 }
 
 async function createRfqCosting(rfqId, payload) {
@@ -261,7 +351,8 @@ async function archiveRfq(rfqId) {
     archived_at: rfq.archived_at || new Date(),
   })
 
-  return serializeRfq(rfq)
+  const salesRepsByEmail = buildSalesRepLookupMap(await getSalesRepOptions())
+  return serializeRfq(rfq, salesRepsByEmail)
 }
 
 async function restoreRfq(rfqId) {
@@ -282,11 +373,13 @@ async function restoreRfq(rfqId) {
     archived_at: null,
   })
 
-  return serializeRfq(rfq)
+  const salesRepsByEmail = buildSalesRepLookupMap(await getSalesRepOptions())
+  return serializeRfq(rfq, salesRepsByEmail)
 }
 
 module.exports = {
   getAllRfqs,
+  getSalesRepOptions,
   createRfq,
   createRfqCosting,
   archiveRfq,

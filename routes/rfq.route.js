@@ -4,10 +4,12 @@ const {
   createRfq,
   createRfqCosting,
   getAllRfqs,
+  getSalesRepOptions,
   restoreRfq,
 } = require('../controllers/rfq.controller')
 
 router.get('/', getAllRfqs)
+router.get('/sales-reps', getSalesRepOptions)
 router.post('/', createRfq)
 router.post('/:rfqId/costings', createRfqCosting)
 router.post('/:rfqId/archive', archiveRfq)

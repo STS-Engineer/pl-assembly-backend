@@ -624,6 +624,22 @@ function assertConversationAccess(authenticatedUser, participants) {
   }
 }
 
+function assertConversationMessageEditAccess(message, authenticatedUser) {
+  if (!authenticatedUser?.id) {
+    throw createHttpError(401, 'Authentication is required.')
+  }
+
+  const authorUserId = Number.parseInt(String(message?.user_id ?? message?.userId ?? '').trim(), 10)
+
+  if (!Number.isInteger(authorUserId) || authorUserId <= 0) {
+    throw createHttpError(404, 'Conversation message not found.')
+  }
+
+  if (authorUserId !== authenticatedUser.id) {
+    throw createHttpError(403, 'You can edit only your own conversation messages.')
+  }
+}
+
 function normalizeStoredAttachments(attachments) {
   if (!Array.isArray(attachments)) {
     return []
@@ -811,6 +827,7 @@ function serializeConversationMessage(item, authorsById) {
     })),
     attachments: normalizeStoredAttachments(rawItem.attachments),
     created_at: rawItem.created_at || rawItem.createdAt || null,
+    updated_at: rawItem.updated_at || rawItem.updatedAt || null,
     author: serializeAuthor(authorsById.get(rawItem.user_id)),
   }
 }
@@ -888,6 +905,7 @@ async function getConversation(costingId, key, authenticatedUser) {
         'mentions',
         'attachments',
         'created_at',
+        'updated_at',
       ],
       order: [
         ['created_at', 'ASC'],
@@ -951,6 +969,7 @@ async function createConversationMessage(costingId, key, payload = {}, authentic
       'mentions',
       'attachments',
       'created_at',
+      'updated_at',
     ],
     order: [
       ['created_at', 'ASC'],
@@ -1045,7 +1064,146 @@ async function createConversationMessage(costingId, key, payload = {}, authentic
   }
 }
 
+async function updateConversationMessage(
+  costingId,
+  key,
+  messageId,
+  payload = {},
+  authenticatedUser,
+) {
+  const context = await getConversationContext(costingId, key)
+  const normalizedMessageId = Number.parseInt(String(messageId || '').trim(), 10)
+
+  if (!Number.isInteger(normalizedMessageId) || normalizedMessageId <= 0) {
+    throw createHttpError(400, 'Invalid conversation message identifier.')
+  }
+
+  const [existingConversationItems, targetMessage] = await Promise.all([
+    SubElementConversationMessage.findAll({
+      where: {
+        rfq_costing_id: context.costing.id,
+        sub_element_key: context.template.key,
+      },
+      attributes: [
+        'id',
+        'rfq_costing_id',
+        'sub_element_key',
+        'user_id',
+        'message',
+        'mentions',
+        'attachments',
+        'created_at',
+        'updated_at',
+      ],
+      order: [
+        ['created_at', 'ASC'],
+        ['id', 'ASC'],
+      ],
+    }),
+    SubElementConversationMessage.findByPk(normalizedMessageId, {
+      attributes: [
+        'id',
+        'rfq_costing_id',
+        'sub_element_key',
+        'user_id',
+        'message',
+        'mentions',
+        'attachments',
+        'created_at',
+        'updated_at',
+      ],
+    }),
+  ])
+
+  const participants = await resolveConversationParticipants(
+    context.subElement,
+    context.template,
+    existingConversationItems,
+  )
+
+  assertConversationAccess(authenticatedUser, participants)
+
+  if (!targetMessage) {
+    throw createHttpError(404, 'Conversation message not found.')
+  }
+
+  if (
+    Number(targetMessage.rfq_costing_id) !== Number(context.costing.id) ||
+    getTrimmedText(targetMessage.sub_element_key) !== getTrimmedText(context.template.key)
+  ) {
+    throw createHttpError(404, 'Conversation message not found in this step.')
+  }
+
+  assertConversationMessageEditAccess(targetMessage, authenticatedUser)
+
+  const normalizedPayload = normalizeMessagePayload(payload)
+  const approvedUsers = await getApprovedUsers()
+  const previousMentionIds = new Set(
+    normalizeStoredMentions(targetMessage?.mentions).map((mention) => mention.id),
+  )
+  const mentionedUsersFromPayload = resolveMentionedUsersFromPayload(
+    payload?.mentions,
+    approvedUsers,
+    authenticatedUser?.id ?? null,
+  )
+  const mentionedUsers = Array.from(
+    new Map(
+      [...mentionedUsersFromPayload, ...resolveMentionedUsers(
+        normalizedPayload.message,
+        approvedUsers,
+        authenticatedUser?.id ?? null,
+      )].map((mentionedUser) => [mentionedUser.id, mentionedUser]),
+    ).values(),
+  )
+
+  await targetMessage.update({
+    message: normalizedPayload.message,
+    mentions: mentionedUsers.map((mentionedUser) => ({
+      id: mentionedUser.id,
+      full_name: mentionedUser.full_name,
+      email: mentionedUser.email,
+      role: mentionedUser.role,
+    })),
+    attachments: normalizedPayload.attachments,
+  })
+
+  const updatedConversationItems = existingConversationItems.map((item) =>
+    Number(item?.id) === normalizedMessageId ? targetMessage : item,
+  )
+  const nextParticipants = await resolveConversationParticipants(
+    context.subElement,
+    context.template,
+    updatedConversationItems,
+  )
+  const [serializedItem] = await serializeConversationMessages([targetMessage])
+  const newlyMentionedUsers = mentionedUsers.filter(
+    (mentionedUser) => !previousMentionIds.has(mentionedUser.id),
+  )
+
+  try {
+    await notifyMentionedUsers(newlyMentionedUsers, context, authenticatedUser)
+  } catch (notificationError) {
+    console.error('[updateConversationMessage] Failed to notify mentioned users:', {
+      message: notificationError.message,
+      costingId,
+      key,
+      messageId: normalizedMessageId,
+      authorUserId: authenticatedUser?.id,
+    })
+  }
+
+  return {
+    message: 'Conversation message updated successfully.',
+    conversation: buildConversationPayload({
+      ...context,
+      participants: nextParticipants,
+    }),
+    item: serializedItem,
+  }
+}
+
 module.exports = {
   getConversation,
   createConversationMessage,
+  updateConversationMessage,
 }

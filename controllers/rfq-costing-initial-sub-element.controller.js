@@ -146,6 +146,26 @@ async function createSubElementConversationMessage(req, res) {
   }
 }
 
+async function updateSubElementConversationMessage(req, res) {
+  try {
+    const authenticatedUser = await getAuthenticatedUser(req)
+    const messageId =
+      req.params.messageId ??
+      req.body?.message_id ??
+      req.body?.messageId
+    const result = await subElementConversationService.updateConversationMessage(
+      req.params.costingId,
+      req.params.key,
+      messageId,
+      req.body,
+      authenticatedUser,
+    )
+    res.status(200).json(result)
+  } catch (error) {
+    handleControllerError(res, error)
+  }
+}
+
 module.exports = {
   getOptions,
   getSubElementsByCostingIds,
@@ -156,4 +176,5 @@ module.exports = {
   approveSubElementByToken,
   getSubElementConversation,
   createSubElementConversationMessage,
+  updateSubElementConversationMessage,
 }
