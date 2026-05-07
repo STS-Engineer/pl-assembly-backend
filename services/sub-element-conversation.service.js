@@ -12,6 +12,9 @@ const MAX_ATTACHMENT_BYTES = 4 * 1024 * 1024
 const MAX_TOTAL_ATTACHMENT_BYTES = 10 * 1024 * 1024
 const MAX_FILENAME_LENGTH = 180
 const DATA_URL_REGEX = /^data:([^;,]+);base64,([a-z0-9+/=\s]+)$/i
+const CHECKLIST_LINE_REGEX = /^(\s*)([-*•])\s+\[( |x|X|c|C)\]\s*(.*)$/
+const ORDERED_LIST_LINE_REGEX = /^(\s*)(\d+)\.\s+(.*)$/
+const UNORDERED_LIST_LINE_REGEX = /^(\s*)([-*•])\s+(.*)$/
 const FRONTEND_DEFAULT_PORT = process.env.PORT || 3000
 const CONVERSATION_CACHE_TTL_MS = Math.max(
   Number.parseInt(String(process.env.CONVERSATION_CACHE_TTL_MS || '5000').trim(), 10) || 5000,
@@ -768,9 +771,115 @@ function normalizeAttachmentPayload(attachment) {
   }
 }
 
+function getConversationContentPayload(payload = {}) {
+  if (Array.isArray(payload?.content_blocks)) {
+    return payload.content_blocks
+  }
+
+  if (Array.isArray(payload?.contentBlocks)) {
+    return payload.contentBlocks
+  }
+
+  if (Array.isArray(payload?.content)) {
+    return payload.content
+  }
+
+  return null
+}
+
+function normalizeConversationParagraphText(value) {
+  return normalizeConversationLineBreaks(value)
+    .split('\n')
+    .map((line) => line.replace(/\s+$/g, ''))
+    .join('\n')
+    .trim()
+}
+
+function normalizeConversationListItemText(value) {
+  return normalizeConversationLineBreaks(value)
+    .split('\n')
+    .map((line) => getTrimmedText(line))
+    .filter(Boolean)
+    .join(' ')
+}
+
+function normalizeConversationContentBlocks(content) {
+  if (!Array.isArray(content)) {
+    return []
+  }
+
+  return content.reduce((blocks, block) => {
+    const normalizedType = getTrimmedText(block?.type).toLowerCase()
+
+    if (normalizedType === 'paragraph') {
+      const text = normalizeConversationParagraphText(block?.text)
+
+      if (text) {
+        blocks.push({
+          type: 'paragraph',
+          text,
+        })
+      }
+
+      return blocks
+    }
+
+    if (
+      normalizedType !== 'checklist' &&
+      normalizedType !== 'ordered-list' &&
+      normalizedType !== 'unordered-list'
+    ) {
+      return blocks
+    }
+
+    const normalizedItems = (Array.isArray(block?.items) ? block.items : [])
+      .map((item, itemIndex) => {
+        const text = normalizeConversationListItemText(item?.text)
+
+        if (!text) {
+          return null
+        }
+
+        if (normalizedType === 'checklist') {
+          return {
+            text,
+            state: normalizeChecklistState(item?.state) || 'pending',
+          }
+        }
+
+        if (normalizedType === 'ordered-list') {
+          return {
+            text,
+            order: itemIndex + 1,
+          }
+        }
+
+        return {
+          text,
+        }
+      })
+      .filter(Boolean)
+
+    if (normalizedItems.length > 0) {
+      blocks.push({
+        type: normalizedType,
+        items: normalizedItems,
+      })
+    }
+
+    return blocks
+  }, [])
+}
+
 function normalizeMessagePayload(payload = {}) {
-  const message = getTrimmedText(payload?.message)
+  const fallbackMessage = getTrimmedText(payload?.message)
+  const payloadContentBlocks = getConversationContentPayload(payload)
   const rawAttachments = Array.isArray(payload?.attachments) ? payload.attachments : []
+  let contentBlocks = normalizeConversationContentBlocks(payloadContentBlocks)
+  let message =
+    contentBlocks.length > 0
+      ? buildConversationMessageFromContentBlocks(contentBlocks)
+      : fallbackMessage
 
   if (message.length > MAX_MESSAGE_LENGTH) {
     throw createHttpError(400, `Message must be ${MAX_MESSAGE_LENGTH} characters or fewer.`)
@@ -790,14 +899,402 @@ function normalizeMessagePayload(payload = {}) {
     throw createHttpError(400, 'Total attachment size must stay below 10 MB.')
   }
 
+  if (contentBlocks.length === 0 && message) {
+    contentBlocks = parseMessageContentBlocks(message)
+  }
+
   if (!message && attachments.length === 0) {
     throw createHttpError(400, 'Please add a message or at least one attachment.')
   }
 
   return {
     message: message || null,
+    content: contentBlocks,
     attachments,
   }
+}
+
+function normalizeConversationLineBreaks(message) {
+  return String(message ?? '').replace(/\r\n?/g, '\n')
+}
+
+function getChecklistItemState(marker = ' ') {
+  const normalizedMarker = getTrimmedText(marker).toLowerCase()
+
+  if (normalizedMarker === 'x') {
+    return 'done'
+  }
+
+  if (normalizedMarker === 'c') {
+    return 'canceled'
+  }
+
+  return 'pending'
+}
+
+function getChecklistMarkerFromState(state = 'pending') {
+  const normalizedState = getTrimmedText(state).toLowerCase()
+
+  if (normalizedState === 'done') {
+    return 'x'
+  }
+
+  if (normalizedState === 'canceled') {
+    return 'c'
+  }
+
+  return ' '
+}
+
+function normalizeChecklistState(state = 'pending') {
+  const normalizedState = getTrimmedText(state).toLowerCase()
+
+  if (normalizedState === 'done') {
+    return 'done'
+  }
+
+  if (normalizedState === 'canceled' || normalizedState === 'cancelled') {
+    return 'canceled'
+  }
+
+  if (normalizedState === 'pending') {
+    return 'pending'
+  }
+
+  return ''
+}
+
+function buildConversationMessageFromContentBlocks(contentBlocks) {
+  const normalizedBlocks = normalizeConversationContentBlocks(contentBlocks)
+
+  if (normalizedBlocks.length === 0) {
+    return ''
+  }
+
+  const lines = []
+
+  normalizedBlocks.forEach((block, blockIndex) => {
+    if (blockIndex > 0 && lines.length > 0) {
+      lines.push('')
+    }
+
+    if (block.type === 'paragraph') {
+      lines.push(...normalizeConversationLineBreaks(block.text).split('\n'))
+      return
+    }
+
+    if (block.type === 'checklist') {
+      block.items.forEach((item) => {
+        lines.push(`- [${getChecklistMarkerFromState(item?.state)}] ${item?.text || ''}`.trimEnd())
+      })
+      return
+    }
+
+    if (block.type === 'ordered-list') {
+      block.items.forEach((item, itemIndex) => {
+        const order = Number.parseInt(String(item?.order ?? '').trim(), 10) || itemIndex + 1
+        lines.push(`${order}. ${item?.text || ''}`.trimEnd())
+      })
+      return
+    }
+
+    if (block.type === 'unordered-list') {
+      block.items.forEach((item) => {
+        lines.push(`- ${item?.text || ''}`.trimEnd())
+      })
+    }
+  })
+
+  return lines.join('\n').trim()
+}
+
+function parseMessageContentBlocks(message) {
+  const normalizedMessage = normalizeConversationLineBreaks(message)
+
+  if (!getTrimmedText(normalizedMessage)) {
+    return []
+  }
+
+  const lines = normalizedMessage.split('\n')
+  const blocks = []
+  let lineIndex = 0
+
+  while (lineIndex < lines.length) {
+    const currentLine = lines[lineIndex]
+    const trimmedCurrentLine = getTrimmedText(currentLine)
+
+    if (!trimmedCurrentLine) {
+      lineIndex += 1
+      continue
+    }
+
+    const checklistMatch = currentLine.match(CHECKLIST_LINE_REGEX)
+
+    if (checklistMatch) {
+      const items = []
+
+      while (lineIndex < lines.length) {
+        const nextLine = lines[lineIndex]
+        const nextMatch = nextLine.match(CHECKLIST_LINE_REGEX)
+
+        if (!nextMatch) {
+          break
+        }
+
+        items.push({
+          line_index: lineIndex,
+          state: getChecklistItemState(nextMatch[3]),
+          text: nextMatch[4] || '',
+        })
+        lineIndex += 1
+      }
+
+      blocks.push({
+        type: 'checklist',
+        items,
+      })
+      continue
+    }
+
+    const orderedListMatch = currentLine.match(ORDERED_LIST_LINE_REGEX)
+
+    if (orderedListMatch) {
+      const items = []
+
+      while (lineIndex < lines.length) {
+        const nextLine = lines[lineIndex]
+        const nextMatch = nextLine.match(ORDERED_LIST_LINE_REGEX)
+
+        if (!nextMatch) {
+          break
+        }
+
+        items.push({
+          line_index: lineIndex,
+          order: Number.parseInt(nextMatch[2], 10) || items.length + 1,
+          text: nextMatch[3] || '',
+        })
+        lineIndex += 1
+      }
+
+      blocks.push({
+        type: 'ordered-list',
+        items,
+      })
+      continue
+    }
+
+    const unorderedListMatch = currentLine.match(UNORDERED_LIST_LINE_REGEX)
+
+    if (unorderedListMatch) {
+      const items = []
+
+      while (lineIndex < lines.length) {
+        const nextLine = lines[lineIndex]
+        const nextChecklistMatch = nextLine.match(CHECKLIST_LINE_REGEX)
+        const nextOrderedListMatch = nextLine.match(ORDERED_LIST_LINE_REGEX)
+        const nextUnorderedListMatch = nextLine.match(UNORDERED_LIST_LINE_REGEX)
+
+        if (!nextUnorderedListMatch || nextChecklistMatch || nextOrderedListMatch) {
+          break
+        }
+
+        items.push({
+          line_index: lineIndex,
+          text: nextUnorderedListMatch[3] || '',
+        })
+        lineIndex += 1
+      }
+
+      blocks.push({
+        type: 'unordered-list',
+        items,
+      })
+      continue
+    }
+
+    const paragraphLines = []
+
+    while (lineIndex < lines.length) {
+      const nextLine = lines[lineIndex]
+      const nextTrimmedLine = getTrimmedText(nextLine)
+
+      if (!nextTrimmedLine) {
+        break
+      }
+
+      if (
+        CHECKLIST_LINE_REGEX.test(nextLine) ||
+        ORDERED_LIST_LINE_REGEX.test(nextLine) ||
+        UNORDERED_LIST_LINE_REGEX.test(nextLine)
+      ) {
+        break
+      }
+
+      paragraphLines.push(nextLine)
+      lineIndex += 1
+    }
+
+    if (paragraphLines.length > 0) {
+      blocks.push({
+        type: 'paragraph',
+        text: paragraphLines.join('\n'),
+      })
+      continue
+    }
+
+    lineIndex += 1
+  }
+
+  return blocks
+}
+
+function getSerializedConversationContentBlocks(content, fallbackMessage = '') {
+  const normalizedContent = normalizeConversationContentBlocks(content)
+
+  if (normalizedContent.length > 0) {
+    return normalizedContent
+  }
+
+  return parseMessageContentBlocks(fallbackMessage)
+}
+
+function updateChecklistLineState(message, lineIndex, nextState) {
+  const normalizedLineIndex = Number.parseInt(String(lineIndex ?? '').trim(), 10)
+
+  if (!Number.isInteger(normalizedLineIndex) || normalizedLineIndex < 0) {
+    throw createHttpError(400, 'Invalid checklist line identifier.')
+  }
+
+  const normalizedChecklistState = normalizeChecklistState(nextState)
+
+  if (!normalizedChecklistState) {
+    throw createHttpError(400, 'Invalid checklist state.')
+  }
+
+  const normalizedMessage = normalizeConversationLineBreaks(message)
+  const lines = normalizedMessage.split('\n')
+
+  if (normalizedLineIndex >= lines.length) {
+    throw createHttpError(404, 'Checklist item not found in this message.')
+  }
+
+  const targetLine = lines[normalizedLineIndex]
+  const checklistMatch = targetLine.match(CHECKLIST_LINE_REGEX)
+
+  if (!checklistMatch) {
+    throw createHttpError(400, 'The selected conversation line is not a checklist item.')
+  }
+
+  const [, indent, bullet, , text] = checklistMatch
+  lines[normalizedLineIndex] = `${indent}${bullet} [${getChecklistMarkerFromState(
+    normalizedChecklistState,
+  )}] ${text || ''}`.trimEnd()
+
+  return lines.join('\n')
+}
+
+function updateChecklistContentState(contentBlocks, blockIndex, itemIndex, nextState) {
+  const normalizedBlockIndex = Number.parseInt(String(blockIndex ?? '').trim(), 10)
+  const normalizedItemIndex = Number.parseInt(String(itemIndex ?? '').trim(), 10)
+  const normalizedChecklistState = normalizeChecklistState(nextState)
+
+  if (!Number.isInteger(normalizedBlockIndex) || normalizedBlockIndex < 0) {
+    throw createHttpError(400, 'Invalid checklist block identifier.')
+  }
+
+  if (!Number.isInteger(normalizedItemIndex) || normalizedItemIndex < 0) {
+    throw createHttpError(400, 'Invalid checklist item identifier.')
+  }
+
+  if (!normalizedChecklistState) {
+    throw createHttpError(400, 'Invalid checklist state.')
+  }
+
+  const normalizedContentBlocks = getSerializedConversationContentBlocks(contentBlocks)
+  const targetBlock = normalizedContentBlocks[normalizedBlockIndex]
+
+  if (!targetBlock || targetBlock.type !== 'checklist') {
+    throw createHttpError(404, 'Checklist block not found in this message.')
+  }
+
+  if (normalizedItemIndex >= targetBlock.items.length) {
+    throw createHttpError(404, 'Checklist item not found in this message.')
+  }
+
+  return normalizedContentBlocks.map((block, currentBlockIndex) => {
+    if (currentBlockIndex !== normalizedBlockIndex) {
+      return block
+    }
+
+    return {
+      ...block,
+      items: block.items.map((item, currentItemIndex) =>
+        currentItemIndex === normalizedItemIndex
+          ? {
+            ...item,
+            state: normalizedChecklistState,
+          }
+          : item,
+      ),
+    }
+  })
+}
+
+function shouldHandleChecklistTogglePayload(payload = {}) {
+  const normalizedAction = getTrimmedText(
+    payload?.action ?? payload?.operation ?? payload?.intent,
+  ).toLowerCase()
+
+  return (
+    payload?.checklist_action === true ||
+    payload?.checklistAction === true ||
+    normalizedAction === 'toggle-checklist-item' ||
+    normalizedAction === 'togglechecklistitem'
+  )
+}
+
+function resolveChecklistToggleNextContent(targetMessage, payload = {}) {
+  const blockIndex = payload?.block_index ?? payload?.blockIndex
+  const itemIndex = payload?.item_index ?? payload?.itemIndex
+  const lineIndex = payload?.line_index ?? payload?.lineIndex
+  const nextState = payload?.state
+  const hasBlockCoordinates =
+    Number.isInteger(Number.parseInt(String(blockIndex ?? '').trim(), 10)) &&
+    Number.isInteger(Number.parseInt(String(itemIndex ?? '').trim(), 10))
+  const hasLineIndex = Number.isInteger(
+    Number.parseInt(String(lineIndex ?? '').trim(), 10),
+  )
+  const fallbackMessage =
+    targetMessage?.message ||
+    buildConversationMessageFromContentBlocks(targetMessage?.content)
+
+  if (hasBlockCoordinates) {
+    try {
+      return updateChecklistContentState(
+        getSerializedConversationContentBlocks(targetMessage?.content, fallbackMessage),
+        blockIndex,
+        itemIndex,
+        nextState,
+      )
+    } catch (error) {
+      if ((error?.statusCode === 404 || error?.statusCode === 400) && hasLineIndex) {
+        return parseMessageContentBlocks(
+          updateChecklistLineState(fallbackMessage, lineIndex, nextState),
+        )
+      }
+
+      throw error
+    }
+  }
+
+  if (hasLineIndex) {
+    return parseMessageContentBlocks(
+      updateChecklistLineState(fallbackMessage, lineIndex, nextState),
+    )
+  }
+
+  throw createHttpError(400, 'Checklist item coordinates are required.')
 }
 
 function serializeAuthor(user = {}) {
@@ -813,12 +1310,14 @@ function serializeAuthor(user = {}) {
 
 function serializeConversationMessage(item, authorsById) {
   const rawItem = item && typeof item.toJSON === 'function' ? item.toJSON() : item || {}
+  const contentBlocks = getSerializedConversationContentBlocks(rawItem.content, rawItem.message || '')
 
   return {
     id: rawItem.id,
     rfq_costing_id: rawItem.rfq_costing_id,
     sub_element_key: rawItem.sub_element_key,
     message: rawItem.message || '',
+    content_blocks: contentBlocks,
     mentions: normalizeStoredMentions(rawItem.mentions).map((mention) => ({
       id: mention.id,
       full_name: mention.full_name,
@@ -902,6 +1401,7 @@ async function getConversation(costingId, key, authenticatedUser) {
         'sub_element_key',
         'user_id',
         'message',
+        'content',
         'mentions',
         'attachments',
         'created_at',
@@ -1007,6 +1507,7 @@ async function createConversationMessage(costingId, key, payload = {}, authentic
     sub_element_key: context.template.key,
     user_id: authenticatedUser.id,
     message: normalizedPayload.message,
+    content: normalizedPayload.content,
     mentions: mentionedUsers.map((mentionedUser) => ({
       id: mentionedUser.id,
       full_name: mentionedUser.full_name,
@@ -1071,6 +1572,16 @@ async function updateConversationMessage(
   payload = {},
   authenticatedUser,
 ) {
+  if (shouldHandleChecklistTogglePayload(payload)) {
+    return toggleConversationChecklistItem(
+      costingId,
+      key,
+      messageId,
+      payload,
+      authenticatedUser,
+    )
+  }
+
   const context = await getConversationContext(costingId, key)
   const normalizedMessageId = Number.parseInt(String(messageId || '').trim(), 10)
 
@@ -1090,6 +1601,7 @@ async function updateConversationMessage(
         'sub_element_key',
         'user_id',
         'message',
+        'content',
         'mentions',
         'attachments',
         'created_at',
@@ -1107,6 +1619,7 @@ async function updateConversationMessage(
         'sub_element_key',
         'user_id',
         'message',
+        'content',
         'mentions',
         'attachments',
         'created_at',
@@ -1158,6 +1671,7 @@ async function updateConversationMessage(
 
   await targetMessage.update({
     message: normalizedPayload.message,
+    content: normalizedPayload.content,
     mentions: mentionedUsers.map((mentionedUser) => ({
       id: mentionedUser.id,
       full_name: mentionedUser.full_name,
@@ -1202,8 +1716,101 @@ async function updateConversationMessage(
   }
 }
 
+async function toggleConversationChecklistItem(
+  costingId,
+  key,
+  messageId,
+  payload = {},
+  authenticatedUser,
+) {
+  const context = await getConversationContext(costingId, key)
+  const normalizedMessageId = Number.parseInt(String(messageId || '').trim(), 10)
+
+  if (!Number.isInteger(normalizedMessageId) || normalizedMessageId <= 0) {
+    throw createHttpError(400, 'Invalid conversation message identifier.')
+  }
+
+  const [existingConversationItems, targetMessage] = await Promise.all([
+    SubElementConversationMessage.findAll({
+      where: {
+        rfq_costing_id: context.costing.id,
+        sub_element_key: context.template.key,
+      },
+      attributes: [
+        'id',
+        'rfq_costing_id',
+        'sub_element_key',
+        'user_id',
+        'message',
+        'content',
+        'mentions',
+        'attachments',
+        'created_at',
+        'updated_at',
+      ],
+      order: [
+        ['created_at', 'ASC'],
+        ['id', 'ASC'],
+      ],
+    }),
+    SubElementConversationMessage.findByPk(normalizedMessageId, {
+      attributes: [
+        'id',
+        'rfq_costing_id',
+        'sub_element_key',
+        'user_id',
+        'message',
+        'content',
+        'mentions',
+        'attachments',
+        'created_at',
+        'updated_at',
+      ],
+    }),
+  ])
+
+  const participants = await resolveConversationParticipants(
+    context.subElement,
+    context.template,
+    existingConversationItems,
+  )
+
+  assertConversationAccess(authenticatedUser, participants)
+
+  if (!targetMessage) {
+    throw createHttpError(404, 'Conversation message not found.')
+  }
+
+  if (
+    Number(targetMessage.rfq_costing_id) !== Number(context.costing.id) ||
+    getTrimmedText(targetMessage.sub_element_key) !== getTrimmedText(context.template.key)
+  ) {
+    throw createHttpError(404, 'Conversation message not found in this step.')
+  }
+
+  const nextContent = resolveChecklistToggleNextContent(targetMessage, payload)
+  const nextMessage = buildConversationMessageFromContentBlocks(nextContent)
+
+  await targetMessage.update({
+    message: nextMessage,
+    content: nextContent,
+  })
+
+  const [serializedItem] = await serializeConversationMessages([targetMessage])
+
+  return {
+    message: 'Checklist item updated successfully.',
+    conversation: buildConversationPayload({
+      ...context,
+      participants,
+    }),
+    item: serializedItem,
+  }
+}
+
 module.exports = {
   getConversation,
   createConversationMessage,
   updateConversationMessage,
+  toggleConversationChecklistItem,
 }

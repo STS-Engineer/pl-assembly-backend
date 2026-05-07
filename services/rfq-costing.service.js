@@ -56,6 +56,27 @@ function normalizeOptionalDate(value) {
     return null
   }
 
+  const isoMatch = trimmedValue.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+
+  if (isoMatch) {
+    const [, year, month, day] = isoMatch
+    const normalizedDate = new Date(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+    )
+
+    if (
+      normalizedDate.getFullYear() !== Number(year) ||
+      normalizedDate.getMonth() !== Number(month) - 1 ||
+      normalizedDate.getDate() !== Number(day)
+    ) {
+      throw createHttpError(400, 'Invalid due date.')
+    }
+
+    return trimmedValue
+  }
+
   const parsedDate = new Date(trimmedValue)
 
   if (Number.isNaN(parsedDate.getTime())) {
@@ -99,6 +120,134 @@ function hasOwnField(payload, fieldName) {
 
 function getNormalizedCostingProductFamily(payload = {}) {
   return getTrimmedText(payload?.product_family ?? payload?.productFamily)
+}
+
+function serializeRfqCosting(costing) {
+  const rawCosting =
+    costing && typeof costing.toJSON === 'function' ? costing.toJSON() : costing || {}
+
+  return {
+    ...rawCosting,
+    due_date: rawCosting.due_date ?? null,
+    dueDate: rawCosting.due_date ?? null,
+    createdAt: rawCosting.createdAt ?? rawCosting.created_at ?? null,
+    updatedAt: rawCosting.updatedAt ?? rawCosting.updated_at ?? null,
+  }
+}
+
+function validateSubElementDeadlineAgainstCostingDueDate(deadlineValue, costingDueDateValue) {
+  const normalizedDeadlineValue = getTrimmedText(deadlineValue)
+  const normalizedCostingDueDateValue = getTrimmedText(costingDueDateValue)
+
+  if (!normalizedDeadlineValue || !normalizedCostingDueDateValue) {
+    return
+  }
+
+  if (normalizedDeadlineValue > normalizedCostingDueDateValue) {
+    throw createHttpError(
+      400,
+      `Deadline cannot be later than the costing due date (${normalizedCostingDueDateValue}).`,
+    )
+  }
+}
+
+function createDateAtStartOfDay(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate())
+}
+
+function isWeekend(date) {
+  const weekDay = createDateAtStartOfDay(date).getDay()
+  return weekDay === 0 || weekDay === 6
+}
+
+function getNextBusinessDay(date) {
+  const nextDate = createDateAtStartOfDay(date)
+
+  while (isWeekend(nextDate)) {
+    nextDate.setDate(nextDate.getDate() + 1)
+  }
+
+  return nextDate
+}
+
+function formatIsoDate(date) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+
+  return `${year}-${month}-${day}`
+}
+
+function addBusinessDays(startDate, durationValue) {
+  if (!Number.isInteger(durationValue) || durationValue <= 0) {
+    return null
+  }
+
+  const endDate = getNextBusinessDay(startDate)
+  let remainingDays = durationValue - 1
+
+  while (remainingDays > 0) {
+    endDate.setDate(endDate.getDate() + 1)
+
+    if (!isWeekend(endDate)) {
+      remainingDays -= 1
+    }
+  }
+
+  return endDate
+}
+
+function validateSubElementDurationAgainstCostingDueDate(durationValue, costingDueDateValue) {
+  const normalizedCostingDueDateValue = getTrimmedText(costingDueDateValue)
+
+  if (!normalizedCostingDueDateValue) {
+    return
+  }
+
+  const projectedDueDate = addBusinessDays(getNextBusinessDay(new Date()), durationValue)
+  const projectedDueDateValue = projectedDueDate ? formatIsoDate(projectedDueDate) : ''
+
+  if (projectedDueDateValue && projectedDueDateValue > normalizedCostingDueDateValue) {
+    throw createHttpError(
+      400,
+      `Duration cannot project a deadline later than the costing due date (${normalizedCostingDueDateValue}).`,
+    )
+  }
+}
+
+async function validateExistingSubElementDeadlinesForCosting(costingId, costingDueDateValue) {
+  const normalizedCostingDueDateValue = getTrimmedText(costingDueDateValue)
+
+  if (!normalizedCostingDueDateValue) {
+    return
+  }
+
+  const existingSubElements = await RfqCostingInitialSubElement.findAll({
+    where: {
+      rfq_costing_id: costingId,
+      due_date: {
+        [Op.ne]: null,
+      },
+    },
+    attributes: ['key', 'title', 'due_date'],
+    order: [
+      ['due_date', 'DESC'],
+      ['id', 'ASC'],
+    ],
+  })
+
+  const violatingSubElement = existingSubElements.find((subElement) =>
+    getTrimmedText(subElement.due_date) > normalizedCostingDueDateValue,
+  )
+
+  if (violatingSubElement) {
+    throw createHttpError(
+      400,
+      `The costing due date cannot be earlier than the deadline of "${
+        getTrimmedText(violatingSubElement.title) || getTrimmedText(violatingSubElement.key)
+      }".`,
+    )
+  }
 }
 
 function buildDefaultSubElementsPayloadForCostingType(costingType) {
@@ -384,6 +533,8 @@ async function syncInitialSubElements(costing, subElementsPayload = []) {
       },
     })
     const updateData = buildInitialSubElementUpdateData(subElementPayload)
+    validateSubElementDeadlineAgainstCostingDueDate(updateData.due_date, costing.due_date)
+    validateSubElementDurationAgainstCostingDueDate(updateData.duration, costing.due_date)
     const defaultPilot = getDefaultPilotValueForSubElementKey(key, defaultPilotsByKey)
     const requestedPilot = normalizeOptionalText(subElementPayload?.pilot)
     const previousStatus = normalizeOptionalText(existingSubElement?.status)
@@ -477,7 +628,7 @@ async function syncInitialSubElements(costing, subElementsPayload = []) {
 }
 
 async function getAllRfqCostings() {
-  return RfqCosting.findAll({
+  const costings = await RfqCosting.findAll({
     include: [
       {
         model: Rfq,
@@ -490,6 +641,8 @@ async function getAllRfqCostings() {
       ['id', 'ASC'],
     ],
   })
+
+  return costings.map((costing) => serializeRfqCosting(costing))
 }
 
 async function getRfqCostingById(id) {
@@ -507,7 +660,7 @@ async function getRfqCostingById(id) {
     throw createHttpError(404, 'RFQ Costing not found.')
   }
 
-  return costing
+  return serializeRfqCosting(costing)
 }
 
 async function getRfqCostingsByRfqId(rfqId) {
@@ -522,7 +675,7 @@ async function getRfqCostingsByRfqId(rfqId) {
     throw createHttpError(404, 'RFQ not found.')
   }
 
-  return RfqCosting.findAll({
+  const costings = await RfqCosting.findAll({
     where: {
       rfq_id: normalizedRfqId,
     },
@@ -538,6 +691,8 @@ async function getRfqCostingsByRfqId(rfqId) {
       ['id', 'ASC'],
     ],
   })
+
+  return costings.map((costing) => serializeRfqCosting(costing))
 }
 
 async function createRfqCosting(payload) {
@@ -546,6 +701,9 @@ async function createRfqCosting(payload) {
   const normalizedReference = getTrimmedText(payload?.reference)
   const normalizedProductFamily = getNormalizedCostingProductFamily(payload)
   const normalizedPlant = getTrimmedText(payload?.plant)
+  const normalizedDueDate = normalizeOptionalDate(
+    payload?.due_date ?? payload?.dueDate ?? payload?.echeance ?? payload?.echeances,
+  )
   const normalizedLink = normalizeOptionalText(payload?.link ?? payload?.url ?? payload?.lien)
 
   if (!normalizedRfqId) {
@@ -591,6 +749,7 @@ async function createRfqCosting(payload) {
     reference: normalizedReference,
     product_family: normalizedProductFamily || 'TBD',
     plant: normalizedPlant,
+    due_date: normalizedDueDate,
     link: supportsCostingLink(normalizedType) ? normalizedLink : null,
   })
 
@@ -606,7 +765,7 @@ async function createRfqCosting(payload) {
     await syncInitialSubElements(costing, buildDefaultSubElementsPayloadForCostingType(costing.type))
   }
 
-  return costing
+  return serializeRfqCosting(costing)
 }
 
 async function updateRfqCosting(id, payload) {
@@ -659,10 +818,24 @@ async function updateRfqCosting(id, payload) {
   if (payload.reference !== undefined) updateData.reference = normalizedReference
   if (hasProductFamilyInput) updateData.product_family = normalizedProductFamily
   if (payload.plant !== undefined) updateData.plant = normalizedPlant
+  if (
+    payload.due_date !== undefined ||
+    payload.dueDate !== undefined ||
+    payload.echeance !== undefined ||
+    payload.echeances !== undefined
+  ) {
+    updateData.due_date = normalizeOptionalDate(
+      payload.due_date ?? payload.dueDate ?? payload.echeance ?? payload.echeances,
+    )
+  }
   if (payload.link !== undefined || payload.url !== undefined || payload.lien !== undefined) {
     updateData.link = supportsCostingLink(nextCostingType) ? normalizedLink : null
   } else if (payload.type !== undefined && !supportsCostingLink(nextCostingType)) {
     updateData.link = null
+  }
+
+  if (Object.prototype.hasOwnProperty.call(updateData, 'due_date')) {
+    await validateExistingSubElementDeadlinesForCosting(id, updateData.due_date)
   }
 
   await costing.update(updateData)
@@ -682,7 +855,8 @@ async function updateRfqCosting(id, payload) {
     )
   }
 
-  return costing.reload()
+  const reloadedCosting = await costing.reload()
+  return serializeRfqCosting(reloadedCosting)
 }
 
 async function deleteRfqCosting(id) {

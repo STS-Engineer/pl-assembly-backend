@@ -111,6 +111,7 @@ async function getCostingDisplayData(costing = {}) {
     ...rfqDisplayData,
     costing_id: rawCosting.id ?? null,
     costing_type: rawCosting.type ?? null,
+    costing_due_date: rawCosting.due_date ?? null,
     costing_link: rawCosting.link ?? null,
   }
 }
@@ -137,6 +138,7 @@ async function getCostingDisplayDataMap(costings = []) {
         ...rfqDisplayData,
         costing_id: rawCosting.id ?? null,
         costing_type: rawCosting.type ?? null,
+        costing_due_date: rawCosting.due_date ?? null,
         costing_link: rawCosting.link ?? null,
       })
     }

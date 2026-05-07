@@ -166,6 +166,22 @@ async function updateSubElementConversationMessage(req, res) {
   }
 }
 
+async function toggleSubElementConversationChecklistItem(req, res) {
+  try {
+    const authenticatedUser = await getAuthenticatedUser(req)
+    const result = await subElementConversationService.toggleConversationChecklistItem(
+      req.params.costingId,
+      req.params.key,
+      req.params.messageId,
+      req.body,
+      authenticatedUser,
+    )
+    res.status(200).json(result)
+  } catch (error) {
+    handleControllerError(res, error)
+  }
+}
+
 module.exports = {
   getOptions,
   getSubElementsByCostingIds,
@@ -177,4 +193,5 @@ module.exports = {
   getSubElementConversation,
   createSubElementConversationMessage,
   updateSubElementConversationMessage,
+  toggleSubElementConversationChecklistItem,
 }

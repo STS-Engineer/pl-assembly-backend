@@ -37,6 +37,11 @@ const SubElementConversationMessage = sequelize.define(
       type: DataTypes.TEXT,
       allowNull: true,
     },
+    content: {
+      type: DataTypes.JSON,
+      allowNull: false,
+      defaultValue: [],
+    },
     mentions: {
       type: DataTypes.JSON,
       allowNull: false,

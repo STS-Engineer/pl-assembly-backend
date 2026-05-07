@@ -8,9 +8,12 @@ const PRODUCT_FAMILY_VALUES = [
   'Wire Harness',
   'Antenna',
   'Simple Injection',
-  'Other',
   'TBD',
   'Assy Electronics',
+  'Bobin',
+  'Busbar',
+  'Grounding System',
+  'Other',
 ]
 
 const COSTING_TYPE_VALUES = [
@@ -52,6 +55,10 @@ const RfqCosting = sequelize.define(
     },
     reference: {
       type: DataTypes.STRING,
+      allowNull: true,
+    },
+    due_date: {
+      type: DataTypes.DATEONLY,
       allowNull: true,
     },
     link: {

@@ -39,6 +39,15 @@ async function createRfq(req, res) {
   }
 }
 
+async function updateRfq(req, res) {
+  try {
+    const rfq = await rfqService.updateRfq(req.params.rfqId, req.body)
+    res.status(200).json(rfq)
+  } catch (error) {
+    handleControllerError(res, error)
+  }
+}
+
 async function createRfqCosting(req, res) {
   try {
     const costing = await rfqService.createRfqCosting(req.params.rfqId, req.body)
@@ -70,6 +79,7 @@ module.exports = {
   getAllRfqs,
   getSalesRepOptions,
   createRfq,
+  updateRfq,
   createRfqCosting,
   archiveRfq,
   restoreRfq,

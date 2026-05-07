@@ -117,6 +117,27 @@ function normalizeDueDate(value) {
     return null
   }
 
+  const isoMatch = trimmedValue.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+
+  if (isoMatch) {
+    const [, year, month, day] = isoMatch
+    const normalizedDate = new Date(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+    )
+
+    if (
+      normalizedDate.getFullYear() !== Number(year) ||
+      normalizedDate.getMonth() !== Number(month) - 1 ||
+      normalizedDate.getDate() !== Number(day)
+    ) {
+      throw createHttpError(400, 'Invalid due date.')
+    }
+
+    return trimmedValue
+  }
+
   const parsedDate = new Date(trimmedValue)
 
   if (Number.isNaN(parsedDate.getTime())) {
@@ -124,6 +145,91 @@ function normalizeDueDate(value) {
   }
 
   return parsedDate.toISOString().slice(0, 10)
+}
+
+function validateDeadlineAgainstCostingDueDate(deadlineValue, costingDueDateValue) {
+  const normalizedDeadlineValue = getTrimmedText(deadlineValue)
+  const normalizedCostingDueDateValue = getTrimmedText(costingDueDateValue)
+
+  if (!normalizedDeadlineValue || !normalizedCostingDueDateValue) {
+    return
+  }
+
+  if (normalizedDeadlineValue > normalizedCostingDueDateValue) {
+    throw createHttpError(
+      400,
+      `Deadline cannot be later than the costing due date (${normalizedCostingDueDateValue}).`,
+    )
+  }
+}
+
+function createDateAtStartOfDay(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate())
+}
+
+function isWeekend(date) {
+  const weekDay = createDateAtStartOfDay(date).getDay()
+  return weekDay === 0 || weekDay === 6
+}
+
+function getNextBusinessDay(date) {
+  const nextDate = createDateAtStartOfDay(date)
+
+  while (isWeekend(nextDate)) {
+    nextDate.setDate(nextDate.getDate() + 1)
+  }
+
+  return nextDate
+}
+
+function formatIsoDate(date) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+
+  return `${year}-${month}-${day}`
+}
+
+function addBusinessDays(startDate, durationValue) {
+  const duration =
+    typeof durationValue === 'number' && Number.isFinite(durationValue)
+      ? durationValue
+      : Number(getTrimmedText(durationValue))
+
+  if (!Number.isInteger(duration) || duration <= 0) {
+    return null
+  }
+
+  const endDate = getNextBusinessDay(startDate)
+  let remainingDays = duration - 1
+
+  while (remainingDays > 0) {
+    endDate.setDate(endDate.getDate() + 1)
+
+    if (!isWeekend(endDate)) {
+      remainingDays -= 1
+    }
+  }
+
+  return endDate
+}
+
+function validateDurationAgainstCostingDueDate(durationValue, costingDueDateValue) {
+  const normalizedCostingDueDateValue = getTrimmedText(costingDueDateValue)
+
+  if (!normalizedCostingDueDateValue) {
+    return
+  }
+
+  const projectedDueDate = addBusinessDays(getNextBusinessDay(new Date()), durationValue)
+  const projectedDueDateValue = projectedDueDate ? formatIsoDate(projectedDueDate) : ''
+
+  if (projectedDueDateValue && projectedDueDateValue > normalizedCostingDueDateValue) {
+    throw createHttpError(
+      400,
+      `Duration cannot project a deadline later than the costing due date (${normalizedCostingDueDateValue}).`,
+    )
+  }
 }
 
 function isPilotPlaceholderValue(value) {
@@ -696,6 +802,129 @@ function getTemplateOrderLookup(costingType) {
   }, new Map())
 }
 
+function getTodayIsoDate() {
+  const today = new Date()
+  const year = today.getFullYear()
+  const month = String(today.getMonth() + 1).padStart(2, '0')
+  const day = String(today.getDate()).padStart(2, '0')
+
+  return `${year}-${month}-${day}`
+}
+
+function parseIsoDate(value) {
+  const isoMatch = getTrimmedText(value).match(/^(\d{4})-(\d{2})-(\d{2})$/)
+
+  if (!isoMatch) {
+    return null
+  }
+
+  const [, year, month, day] = isoMatch
+  const parsedDate = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)))
+
+  if (
+    parsedDate.getUTCFullYear() !== Number(year) ||
+    parsedDate.getUTCMonth() !== Number(month) - 1 ||
+    parsedDate.getUTCDate() !== Number(day)
+  ) {
+    return null
+  }
+
+  return parsedDate
+}
+
+function getIsoDateDifferenceInDays(fromValue, toValue) {
+  const fromDate = parseIsoDate(fromValue)
+  const toDate = parseIsoDate(toValue)
+
+  if (!fromDate || !toDate) {
+    return null
+  }
+
+  return Math.round((toDate.getTime() - fromDate.getTime()) / 86400000)
+}
+
+function getDeadlineAlertColumnName(daysRemaining) {
+  if (daysRemaining === 2) {
+    return 'deadline_alert_j2_sent_for_date'
+  }
+
+  if (daysRemaining === 1) {
+    return 'deadline_alert_j1_sent_for_date'
+  }
+
+  if (daysRemaining === 0) {
+    return 'deadline_alert_j0_sent_for_date'
+  }
+
+  return null
+}
+
+function getApprovalDeadlineAlertColumnName(daysRemaining) {
+  if (daysRemaining === 2) {
+    return 'approval_deadline_alert_j2_sent_for_date'
+  }
+
+  if (daysRemaining === 1) {
+    return 'approval_deadline_alert_j1_sent_for_date'
+  }
+
+  if (daysRemaining === 0) {
+    return 'approval_deadline_alert_j0_sent_for_date'
+  }
+
+  return null
+}
+
+function hasPendingApprovalRequest(subElement) {
+  const normalizedStatus = getTrimmedText(subElement?.status)
+  const normalizedApprovalStatus = getTrimmedText(subElement?.approval_status)
+  const approvalToken = getTrimmedText(subElement?.approval_token)
+  const pendingApprovalStatuses = new Set(['Not requested', 'To be approved'])
+
+  return (
+    normalizedStatus === 'Done' &&
+    normalizedApprovalStatus !== 'Approved' &&
+    (Boolean(approvalToken) || pendingApprovalStatuses.has(normalizedApprovalStatus))
+  )
+}
+
+function isApprovalTokenExpired(subElement) {
+  if (!subElement?.approval_token_expires_at) {
+    return true
+  }
+
+  const expiryDate = new Date(subElement.approval_token_expires_at)
+
+  if (Number.isNaN(expiryDate.getTime())) {
+    return true
+  }
+
+  return expiryDate <= new Date()
+}
+
+async function ensureActiveApprovalToken(subElement) {
+  const currentToken = getTrimmedText(subElement?.approval_token)
+
+  if (currentToken && !isApprovalTokenExpired(subElement)) {
+    return currentToken
+  }
+
+  const nextApprovalToken = generateApprovalToken()
+  const nextApprovalTokenExpiresAt = getApprovalTokenExpiryDate()
+
+  await subElement.update({
+    approval_token: nextApprovalToken,
+    approval_token_expires_at: nextApprovalTokenExpiresAt,
+  })
+
+  return nextApprovalToken
+}
+
+function getLastTemplateForCostingType(costingType) {
+  const templates = getTemplatesForCostingType(costingType)
+  return templates.length > 0 ? templates[templates.length - 1] : null
+}
+
 async function updateLateStatuses() {
   try {
     const today = new Date()
@@ -731,6 +960,282 @@ async function updateLateStatuses() {
 
   } catch (error) {
     console.error('❌ Error in late status update check:', error.message)
+  }
+}
+
+async function sendFinalSubElementDeadlineReminders() {
+  try {
+    const costings = await RfqCosting.findAll({
+      where: {
+        type: RfqCostingInitialSubElement.SUPPORTED_COSTING_TYPES,
+      },
+      attributes: ['id', 'rfq_id', 'type', 'reference', 'link'],
+      order: [['id', 'ASC']],
+    })
+
+    if (costings.length === 0) {
+      return {
+        sent_count: 0,
+        skipped_count: 0,
+      }
+    }
+
+    const todayValue = getTodayIsoDate()
+    const [itemsByCostingId, costingDisplayDataById] = await Promise.all([
+      ensureDefaultSubElementsByCostingIds(costings.map((costing) => costing.id)),
+      getCostingDisplayDataMap(costings),
+    ])
+
+    let sentCount = 0
+    let skippedCount = 0
+
+    for (const costing of costings) {
+      try {
+        const finalTemplate = getLastTemplateForCostingType(costing.type)
+
+        if (!finalTemplate) {
+          skippedCount++
+          continue
+        }
+
+        const finalSubElement =
+          (itemsByCostingId.get(String(costing.id)) || []).find(
+            (item) => item.key === finalTemplate.key,
+          ) || null
+
+        if (!finalSubElement) {
+          skippedCount++
+          continue
+        }
+
+        const dueDateValue = getTrimmedText(finalSubElement.due_date)
+        const reminderStatus = getTrimmedText(finalSubElement.status)
+
+        if (!dueDateValue || reminderStatus === 'Done') {
+          skippedCount++
+          continue
+        }
+
+        const daysRemaining = getIsoDateDifferenceInDays(todayValue, dueDateValue)
+        const reminderColumnName = getDeadlineAlertColumnName(daysRemaining)
+
+        if (!reminderColumnName) {
+          skippedCount++
+          continue
+        }
+
+        if (getTrimmedText(finalSubElement[reminderColumnName]) === dueDateValue) {
+          skippedCount++
+          continue
+        }
+
+        const resolvedPilotUser = await resolvePilotUser({ pilot: finalSubElement.pilot })
+        const fallbackPilotEmail = isValidEmail(finalSubElement.pilot)
+          ? getTrimmedText(finalSubElement.pilot).toLowerCase()
+          : ''
+        const pilotEmail =
+          getTrimmedText(resolvedPilotUser?.email).toLowerCase() || fallbackPilotEmail
+        const pilotName =
+          getTrimmedText(resolvedPilotUser?.full_name) ||
+          getTrimmedText(finalSubElement.pilot) ||
+          DEFAULT_PILOT_PLACEHOLDER
+        const notificationRecipients = resolvedPilotUser
+          ? [
+              {
+                user_id: resolvedPilotUser.id,
+                email: pilotEmail || null,
+              },
+            ]
+          : pilotEmail
+            ? [pilotEmail]
+            : null
+
+        if (!pilotEmail && !resolvedPilotUser?.id) {
+          console.warn('âš ï¸ Unable to send final sub-element deadline reminder: pilot not found.', {
+            costing_id: costing.id,
+            costing_type: costing.type,
+            sub_element_key: finalSubElement.key,
+            pilot: finalSubElement.pilot,
+          })
+          skippedCount++
+          continue
+        }
+
+        const costingDisplayData =
+          costingDisplayDataById.get(String(costing.id)) || (await getCostingDisplayData(costing))
+
+        await emailService.sendSubElementDeadlineReminderNotification({
+          to: pilotEmail || null,
+          pilotName,
+          projectContext: costingDisplayData,
+          costingId: costing.id,
+          costingType: costing.type,
+          costingReference: costing.reference || null,
+          subElementKey: finalSubElement.key,
+          subElementTitle: finalSubElement.title || finalTemplate.title,
+          dueDate: dueDateValue,
+          daysRemaining,
+          notificationRecipients,
+        })
+
+        await finalSubElement.update({
+          [reminderColumnName]: dueDateValue,
+        })
+
+        sentCount++
+      } catch (error) {
+        skippedCount++
+        console.error('âŒ Error while sending final sub-element deadline reminder:', {
+          costing_id: costing.id,
+          costing_type: costing.type,
+          message: error.message,
+        })
+      }
+    }
+
+    return {
+      sent_count: sentCount,
+      skipped_count: skippedCount,
+    }
+  } catch (error) {
+    console.error('âŒ Error while checking final sub-element deadline reminders:', error.message)
+    throw error
+  }
+}
+
+async function sendPendingApprovalDeadlineReminders() {
+  try {
+    const costings = await RfqCosting.findAll({
+      where: {
+        type: RfqCostingInitialSubElement.SUPPORTED_COSTING_TYPES,
+      },
+      attributes: ['id', 'rfq_id', 'type', 'reference', 'link'],
+      order: [['id', 'ASC']],
+    })
+
+    if (costings.length === 0) {
+      return {
+        sent_count: 0,
+        skipped_count: 0,
+      }
+    }
+
+    const todayValue = getTodayIsoDate()
+    const [itemsByCostingId, costingDisplayDataById] = await Promise.all([
+      ensureDefaultSubElementsByCostingIds(costings.map((costing) => costing.id)),
+      getCostingDisplayDataMap(costings),
+    ])
+
+    let sentCount = 0
+    let skippedCount = 0
+
+    for (const costing of costings) {
+      const subElements = itemsByCostingId.get(String(costing.id)) || []
+
+      for (const subElement of subElements) {
+        try {
+          const dueDateValue = getTrimmedText(subElement.due_date)
+
+          if (!dueDateValue || !hasPendingApprovalRequest(subElement)) {
+            skippedCount++
+            continue
+          }
+
+          const daysRemaining = getIsoDateDifferenceInDays(todayValue, dueDateValue)
+          const reminderColumnName = getApprovalDeadlineAlertColumnName(daysRemaining)
+
+          if (!reminderColumnName) {
+            skippedCount++
+            continue
+          }
+
+          if (getTrimmedText(subElement[reminderColumnName]) === dueDateValue) {
+            skippedCount++
+            continue
+          }
+
+          const approvers = await findApproversBySubElementKey(subElement.key)
+          const validApprovers = approvers.filter((approver) => getTrimmedText(approver?.email))
+
+          if (validApprovers.length === 0) {
+            console.warn('Unable to send pending approval reminder: approver not found.', {
+              costing_id: costing.id,
+              costing_type: costing.type,
+              sub_element_key: subElement.key,
+            })
+            skippedCount++
+            continue
+          }
+
+          const approvalToken = await ensureActiveApprovalToken(subElement)
+          const costingDisplayData =
+            costingDisplayDataById.get(String(costing.id)) || (await getCostingDisplayData(costing))
+
+          let sentForSubElement = false
+
+          for (const approver of validApprovers) {
+            try {
+              await emailService.sendSubElementApprovalDeadlineReminderNotification({
+                approverEmail: approver.email,
+                pilotName: subElement.pilot,
+                projectContext: costingDisplayData,
+                costingId: costing.id,
+                costingType: costing.type,
+                costingReference: costing.reference || null,
+                subElementKey: subElement.key,
+                subElementTitle: subElement.title,
+                dueDate: dueDateValue,
+                daysRemaining,
+                approvalToken,
+                link: costing.link || subElement.link || null,
+                notificationRecipients: [
+                  {
+                    user_id: approver.id,
+                    email: approver.email || null,
+                  },
+                ],
+              })
+              sentForSubElement = true
+            } catch (error) {
+              console.error('Error while sending pending approval reminder to approver:', {
+                costing_id: costing.id,
+                costing_type: costing.type,
+                sub_element_key: subElement.key,
+                approver_email: approver.email,
+                message: error.message,
+              })
+            }
+          }
+
+          if (!sentForSubElement) {
+            skippedCount++
+            continue
+          }
+
+          await subElement.update({
+            [reminderColumnName]: dueDateValue,
+          })
+
+          sentCount++
+        } catch (error) {
+          skippedCount++
+          console.error('Error while processing pending approval deadline reminder:', {
+            costing_id: costing.id,
+            costing_type: costing.type,
+            sub_element_key: subElement?.key,
+            message: error.message,
+          })
+        }
+      }
+    }
+
+    return {
+      sent_count: sentCount,
+      skipped_count: skippedCount,
+    }
+  } catch (error) {
+    console.error('Error while checking pending approval deadline reminders:', error.message)
+    throw error
   }
 }
 
@@ -1302,11 +1807,18 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
     )
   }
 
+  validateDeadlineAgainstCostingDueDate(updateData.due_date, costing.due_date)
+  validateDurationAgainstCostingDueDate(updateData.duration, costing.due_date)
+
 
   const previousApprovalStatus = item.approval_status
   const previousPilot = item.pilot
   const previousStatus = item.status
   const resolvedPilotUser = updateData.pilot !== undefined ? await resolvePilotUser(payload) : null
+  const statusWasUpdated = updateData.status !== undefined
+  const statusIsDone = updateData.status === 'Done'
+  const statusJustDone = statusIsDone && previousStatus !== 'Done'
+  let pendingApprovalToken = getTrimmedText(item.approval_token)
 
   if (Object.keys(updateData).length > 0) {
     await item.update(updateData)
@@ -1314,6 +1826,19 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
 
 
   // Envoyer un email au pilot quand il est affecté
+  if (statusJustDone) {
+    pendingApprovalToken = generateApprovalToken()
+
+    await item.update({
+      approval_status: 'To be approved',
+      approval_token: pendingApprovalToken,
+      approval_token_expires_at: getApprovalTokenExpiryDate(),
+      approval_deadline_alert_j2_sent_for_date: null,
+      approval_deadline_alert_j1_sent_for_date: null,
+      approval_deadline_alert_j0_sent_for_date: null,
+    })
+  }
+
   const pilotWasAssigned = updateData.pilot !== undefined && updateData.pilot !== previousPilot
 
   if (pilotWasAssigned && updateData.pilot) {
@@ -1342,9 +1867,6 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
   }
 
   try {
-    const statusWasUpdated = updateData.status !== undefined
-    const statusIsDone = updateData.status === 'Done'
-    const statusJustDone = statusIsDone && previousStatus !== 'Done'
     const statusIsNotifiable = ['Help!!!', 'Late!', 'Escalation level 1'].includes(updateData.status)
 
     if (statusWasUpdated && statusJustDone) {
@@ -1353,14 +1875,6 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
           const approvers = await findApproversBySubElementKey(key)
 
           if (approvers && approvers.length > 0) {
-            const approvalToken = generateApprovalToken()
-            const approvalTokenExpiresAt = getApprovalTokenExpiryDate()
-
-            await item.update({
-              approval_token: approvalToken,
-              approval_token_expires_at: approvalTokenExpiresAt,
-            })
-
             for (const approver of approvers) {
               if (approver.email) {
                 await emailService.sendSubElementApprovalRequest(
@@ -1369,7 +1883,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
                   costingDisplayData,
                   costing.id,
                   template.title,
-                  approvalToken,
+                  pendingApprovalToken,
                   costing.link || item.link
                 )
               }
@@ -1441,7 +1955,7 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
   }
 
   const approvalJustGranted =
-    updateData.approval_status === 'Approved' &&
+    item.approval_status === 'Approved' &&
     previousApprovalStatus !== 'Approved'
 
   if (approvalJustGranted) {
@@ -1905,5 +2419,7 @@ module.exports = {
   updateSubElementByKey,
   getSubElementByApprovalToken,
   approveSubElementByToken,
+  sendFinalSubElementDeadlineReminders,
+  sendPendingApprovalDeadlineReminders,
   updateLateStatuses,
 }

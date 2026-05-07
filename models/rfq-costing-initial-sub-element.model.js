@@ -64,6 +64,30 @@ const RfqCostingInitialSubElement = sequelize.define(
       type: DataTypes.DATEONLY,
       allowNull: true,
     },
+    deadline_alert_j2_sent_for_date: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
+    deadline_alert_j1_sent_for_date: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
+    deadline_alert_j0_sent_for_date: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
+    approval_deadline_alert_j2_sent_for_date: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
+    approval_deadline_alert_j1_sent_for_date: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
+    approval_deadline_alert_j0_sent_for_date: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
     link: {
       type: DataTypes.STRING,
       allowNull: true,

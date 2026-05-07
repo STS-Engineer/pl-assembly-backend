@@ -74,6 +74,43 @@ function normalizeOptionalLink(value) {
   return getTrimmedText(value) || null
 }
 
+function normalizeOptionalDate(value) {
+  const trimmedValue = getTrimmedText(value)
+
+  if (!trimmedValue) {
+    return null
+  }
+
+  const isoMatch = trimmedValue.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+
+  if (isoMatch) {
+    const [, year, month, day] = isoMatch
+    const normalizedDate = new Date(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+    )
+
+    if (
+      normalizedDate.getFullYear() !== Number(year) ||
+      normalizedDate.getMonth() !== Number(month) - 1 ||
+      normalizedDate.getDate() !== Number(day)
+    ) {
+      throw createHttpError(400, 'Invalid due date.')
+    }
+
+    return trimmedValue
+  }
+
+  const parsedDate = new Date(trimmedValue)
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    throw createHttpError(400, 'Invalid due date.')
+  }
+
+  return parsedDate.toISOString().slice(0, 10)
+}
+
 async function findRfqByIdentifier(rfqIdentifier) {
   const normalizedIdentifier = getTrimmedText(rfqIdentifier)
 
@@ -128,6 +165,8 @@ function serializeRfqCosting(costing) {
     product_family: rawCosting.product_family,
     plant: rawCosting.plant,
     reference: rawCosting.reference,
+    due_date: rawCosting.due_date ?? null,
+    dueDate: rawCosting.due_date ?? null,
     link: rawCosting.link ?? null,
     createdAt: rawCosting.createdAt ?? rawCosting.created_at ?? null,
     updatedAt: rawCosting.updatedAt ?? rawCosting.updated_at ?? null,
@@ -207,6 +246,21 @@ async function getSalesRepOptions() {
     .filter((salesRep) => salesRep.email)
 }
 
+async function findSalesRepByEmail(normalizedCommercialEmail) {
+  if (!normalizedCommercialEmail) {
+    return null
+  }
+
+  return SalesRep.findOne({
+    where: {
+      email: {
+        [Op.iLike]: normalizedCommercialEmail,
+      },
+    },
+    attributes: ['id', 'email', 'full_name'],
+  })
+}
+
 async function getAllRfqs(options = {}) {
   const [rfqs, salesReps] = await Promise.all([
     Rfq.findAll({
@@ -250,14 +304,7 @@ async function createRfq(payload) {
     throw createHttpError(400, 'Commercial email is required.')
   }
 
-  const matchingSalesRep = await SalesRep.findOne({
-    where: {
-      email: {
-        [Op.iLike]: normalizedCommercialEmail,
-      },
-    },
-    attributes: ['id', 'email', 'full_name'],
-  })
+  const matchingSalesRep = await findSalesRepByEmail(normalizedCommercialEmail)
 
   if (!matchingSalesRep) {
     throw createHttpError(400, 'Selected commercial was not found.')
@@ -283,12 +330,128 @@ async function createRfq(payload) {
   }, buildSalesRepLookupMap([matchingSalesRep]))
 }
 
+async function updateRfq(rfqId, payload) {
+  const normalizedRfqId = getTrimmedText(rfqId)
+
+  if (!normalizedRfqId) {
+    throw createHttpError(400, 'RFQ identifier is required.')
+  }
+
+  const rfq = await findRfqByIdentifier(normalizedRfqId)
+
+  if (!rfq) {
+    throw createHttpError(404, 'RFQ not found.')
+  }
+
+  const currentRfqData =
+    rfq.rfq_data && typeof rfq.rfq_data === 'object' && !Array.isArray(rfq.rfq_data)
+      ? rfq.rfq_data
+      : {}
+  const nextRfqId =
+    getTrimmedText(payload?.rfq_id ?? payload?.reference ?? payload?.rfq_data?.systematic_rfq_id) ||
+    getTrimmedText(rfq.rfq_id)
+  const requestedCommercialEmail = normalizeOptionalEmail(
+    payload?.created_by_email ??
+      payload?.createdByEmail ??
+      payload?.commercial ??
+      payload?.rfq_data?.created_by_email ??
+      payload?.rfq_data?.createdByEmail ??
+      payload?.rfq_data?.commercial,
+  )
+  const normalizedCommercialEmail =
+    requestedCommercialEmail || normalizeOptionalEmail(rfq.created_by_email)
+
+  if (!nextRfqId) {
+    throw createHttpError(400, 'RFQ identifier is required.')
+  }
+
+  if (!normalizedCommercialEmail) {
+    throw createHttpError(400, 'Commercial email is required.')
+  }
+
+  const matchingSalesRep = await findSalesRepByEmail(normalizedCommercialEmail)
+
+  if (!matchingSalesRep) {
+    throw createHttpError(400, 'Selected commercial was not found.')
+  }
+
+  if (nextRfqId !== getTrimmedText(rfq.rfq_id)) {
+    const conflictingRfq = await Rfq.findByPk(nextRfqId)
+
+    if (conflictingRfq && getTrimmedText(conflictingRfq.rfq_id) !== getTrimmedText(rfq.rfq_id)) {
+      throw createHttpError(409, 'RFQ already exists.')
+    }
+  }
+
+  const requestedRfqData =
+    payload?.rfq_data && typeof payload.rfq_data === 'object' && !Array.isArray(payload.rfq_data)
+      ? payload.rfq_data
+      : {}
+  const hasCustomerNameField =
+    Object.prototype.hasOwnProperty.call(requestedRfqData, 'customer_name') ||
+    Object.prototype.hasOwnProperty.call(payload || {}, 'customer_name') ||
+    Object.prototype.hasOwnProperty.call(payload || {}, 'customerName')
+  const hasProjectNameField =
+    Object.prototype.hasOwnProperty.call(requestedRfqData, 'project_name') ||
+    Object.prototype.hasOwnProperty.call(payload || {}, 'project_name') ||
+    Object.prototype.hasOwnProperty.call(payload || {}, 'projectName')
+  const hasCurrencyField =
+    Object.prototype.hasOwnProperty.call(requestedRfqData, 'target_price_currency') ||
+    Object.prototype.hasOwnProperty.call(payload || {}, 'target_price_currency') ||
+    Object.prototype.hasOwnProperty.call(payload || {}, 'targetPriceCurrency') ||
+    Object.prototype.hasOwnProperty.call(payload || {}, 'currency')
+
+  const nextCustomerName = getTrimmedText(
+    requestedRfqData.customer_name ?? payload?.customer_name ?? payload?.customerName,
+  )
+  const nextProjectName = getTrimmedText(
+    requestedRfqData.project_name ?? payload?.project_name ?? payload?.projectName,
+  )
+  const nextCurrency = getTrimmedText(
+    requestedRfqData.target_price_currency ??
+      payload?.target_price_currency ??
+      payload?.targetPriceCurrency ??
+      payload?.currency,
+  )
+
+  const nextRfqData = normalizeRfqData(nextRfqId, {
+    ...currentRfqData,
+    ...requestedRfqData,
+    systematic_rfq_id: nextRfqId,
+    commercial: normalizedCommercialEmail,
+    ...(hasCustomerNameField ? { customer_name: nextCustomerName } : {}),
+    ...(hasProjectNameField ? { project_name: nextProjectName } : {}),
+    ...(hasCurrencyField ? { target_price_currency: nextCurrency || 'EUR' } : {}),
+  })
+
+  await rfq.update({
+    rfq_id: nextRfqId,
+    rfq_data: nextRfqData,
+    created_by_email: normalizedCommercialEmail,
+  })
+
+  const updatedRfq = await Rfq.findByPk(nextRfqId, {
+    include: [
+      {
+        model: RfqCosting,
+        as: 'costings',
+        required: false,
+      },
+    ],
+  })
+
+  return serializeRfq(updatedRfq || rfq, buildSalesRepLookupMap([matchingSalesRep]))
+}
+
 async function createRfqCosting(rfqId, payload) {
   const normalizedRfqId = getTrimmedText(rfqId)
   const normalizedType = getTrimmedText(payload?.type)
   const normalizedReference = getTrimmedText(payload?.reference)
   const normalizedProductFamily = getTrimmedText(payload?.product_family)
   const normalizedPlant = getTrimmedText(payload?.plant)
+  const normalizedDueDate = normalizeOptionalDate(
+    payload?.due_date ?? payload?.dueDate ?? payload?.echeance ?? payload?.echeances,
+  )
   const normalizedLink = normalizeOptionalLink(payload?.link ?? payload?.url ?? payload?.lien)
 
   if (!normalizedRfqId) {
@@ -327,6 +490,7 @@ async function createRfqCosting(rfqId, payload) {
     reference: normalizedReference,
     product_family: normalizedProductFamily,
     plant: normalizedPlant,
+    due_date: normalizedDueDate,
     link: supportsCostingLink(normalizedType) ? normalizedLink : null,
   })
 
@@ -381,6 +545,7 @@ module.exports = {
   getAllRfqs,
   getSalesRepOptions,
   createRfq,
+  updateRfq,
   createRfqCosting,
   archiveRfq,
   restoreRfq,

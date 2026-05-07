@@ -10,6 +10,7 @@ const {
   getSubElementConversation,
   createSubElementConversationMessage,
   updateSubElementConversationMessage,
+  toggleSubElementConversationChecklistItem,
 } = require('../controllers/rfq-costing-initial-sub-element.controller')
 
 router.get('/options', getOptions)
@@ -23,6 +24,10 @@ router.patch('/costing/:costingId/:key/conversation', updateSubElementConversati
 router.patch(
   '/costing/:costingId/:key/conversation/:messageId',
   updateSubElementConversationMessage,
+)
+router.patch(
+  '/costing/:costingId/:key/conversation/:messageId/checklist',
+  toggleSubElementConversationChecklistItem,
 )
 router.patch('/approval/:token', approveSubElementByToken)
 router.patch('/costing/:costingId/:key', updateSubElementByKey)

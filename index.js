@@ -3,6 +3,7 @@ require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
 const cron = require('node-cron')
+const { DataTypes } = require('sequelize')
 const sequelize = require('./config/sequelize')
 const User = require('./models/user.model')
 const Notification = require('./models/notification.model')
@@ -10,11 +11,13 @@ const Rfq = require('./models/rfq.model')
 const RfqCosting = require('./models/rfq-costing.model')
 const RfqCostingInitialSubElement = require('./models/rfq-costing-initial-sub-element.model')
 const SubElementConversationMessage = require('./models/sub-element-conversation-message.model')
+const ProductDevelopmentProduct = require('./models/product-development-product.model')
 const emailService = require('./emails/email.service')
 const rfqCostingInitialSubElementService = require('./services/rfq-costing-initial-sub-element.service')
 
 const RFQCosting = require('./routes/rfq-costing.route')
 const notificationRoutes = require('./routes/notification.route')
+const productDevelopmentRoutes = require('./routes/product-development.route')
 const rfqCostingInitialSubElementRoutes = require('./routes/rfq-costing-initial-sub-element.route')
 const userRoutes = require('./routes/user.route')
 const rfqRoutes = require('./routes/rfq.route')
@@ -80,6 +83,7 @@ app.use(express.json({ limit: '16mb' }))
 
 app.use('/api/users', userRoutes)
 app.use('/api/notifications', notificationRoutes)
+app.use('/api/product-development', productDevelopmentRoutes)
 app.use('/api/rfqs', rfqRoutes)
 app.use('/api/rfq-costing', RFQCosting)
 app.use('/api/rfq-costing-initial-sub-elements', rfqCostingInitialSubElementRoutes)
@@ -192,6 +196,100 @@ async function ensureConversationMessageIndexNames() {
   }
 }
 
+async function ensureRfqCostingDueDateColumn() {
+  const queryInterface = sequelize.getQueryInterface()
+  const tableName = RfqCosting.getTableName()
+  const existingTables = await queryInterface.showAllTables()
+  const normalizedTableNames = new Set(
+    existingTables
+      .map((tableEntry) => normalizeTableName(tableEntry))
+      .filter(Boolean),
+  )
+
+  if (!normalizedTableNames.has(tableName)) {
+    return
+  }
+
+  const tableDescription = await queryInterface.describeTable(tableName)
+
+  if (tableDescription?.due_date) {
+    return
+  }
+
+  await queryInterface.addColumn(tableName, 'due_date', {
+    type: DataTypes.DATEONLY,
+    allowNull: true,
+  })
+}
+
+async function ensureRfqCostingSubElementDeadlineAlertColumns() {
+  const queryInterface = sequelize.getQueryInterface()
+  const tableName = RfqCostingInitialSubElement.getTableName()
+  const existingTables = await queryInterface.showAllTables()
+  const normalizedTableNames = new Set(
+    existingTables
+      .map((tableEntry) => normalizeTableName(tableEntry))
+      .filter(Boolean),
+  )
+
+  if (!normalizedTableNames.has(tableName)) {
+    return
+  }
+
+  const tableDescription = await queryInterface.describeTable(tableName)
+  const alertColumns = [
+    'deadline_alert_j2_sent_for_date',
+    'deadline_alert_j1_sent_for_date',
+    'deadline_alert_j0_sent_for_date',
+    'approval_deadline_alert_j2_sent_for_date',
+    'approval_deadline_alert_j1_sent_for_date',
+    'approval_deadline_alert_j0_sent_for_date',
+  ]
+
+  for (const columnName of alertColumns) {
+    if (tableDescription?.[columnName]) {
+      continue
+    }
+
+    await queryInterface.addColumn(tableName, columnName, {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    })
+  }
+}
+
+async function ensureProductDevelopmentArchiveColumns() {
+  const queryInterface = sequelize.getQueryInterface()
+  const tableName = ProductDevelopmentProduct.getTableName()
+  const existingTables = await queryInterface.showAllTables()
+  const normalizedTableNames = new Set(
+    existingTables
+      .map((tableEntry) => normalizeTableName(tableEntry))
+      .filter(Boolean),
+  )
+
+  if (!normalizedTableNames.has(tableName)) {
+    return
+  }
+
+  const tableDescription = await queryInterface.describeTable(tableName)
+
+  if (!tableDescription?.is_archived) {
+    await queryInterface.addColumn(tableName, 'is_archived', {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    })
+  }
+
+  if (!tableDescription?.archived_at) {
+    await queryInterface.addColumn(tableName, 'archived_at', {
+      type: DataTypes.DATE,
+      allowNull: true,
+    })
+  }
+}
+
 function closeServer() {
   if (!httpServer) {
     return Promise.resolve()
@@ -255,22 +353,36 @@ async function startServer() {
   console.log('PostgreSQL connected successfully')
 
   await ensureConversationMessageIndexNames()
+  await ensureRfqCostingDueDateColumn()
+  await ensureRfqCostingSubElementDeadlineAlertColumns()
+  await ensureProductDevelopmentArchiveColumns()
   await sequelize.sync({ alter: true })
   console.log('Models synchronized successfully')
 
   await User.ensureApprovalState()
   registerProcessHandlers()
 
+  try {
+    await rfqCostingInitialSubElementService.sendFinalSubElementDeadlineReminders()
+    await rfqCostingInitialSubElementService.sendPendingApprovalDeadlineReminders()
+  } catch (error) {
+    console.error('Unable to run startup reminder jobs:', error.message)
+  }
+
   // Configurer le cron job pour mettre à jour les statuts Late! à chaque minuit
   cron.schedule('0 0 * * *', async () => {
     console.log('📅 Running midnight late status update...')
     try {
       await rfqCostingInitialSubElementService.updateLateStatuses()
+      await rfqCostingInitialSubElementService.sendFinalSubElementDeadlineReminders()
+      await rfqCostingInitialSubElementService.sendPendingApprovalDeadlineReminders()
     } catch (error) {
       console.error('❌ Error in midnight late status update:', error.message)
     }
   })
-  console.log('📅 Cron job scheduled: updateLateStatuses will run every midnight')
+  console.log(
+    '📅 Cron job scheduled: updateLateStatuses and sendFinalSubElementDeadlineReminders will run every midnight',
+  )
 
   if (httpServer) {
     return httpServer

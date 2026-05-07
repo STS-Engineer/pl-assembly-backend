@@ -135,6 +135,30 @@ function getWorkspaceCostingUrl() {
   return `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/workspace/costing`
 }
 
+function getSubElementApprovalPageUrl(approvalToken) {
+  return `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/approve-sub-element/${encodeURIComponent(approvalToken)}`
+}
+
+function formatLongDate(value, fallback = 'No deadline') {
+  const normalizedValue = getOptionalText(value)
+
+  if (!normalizedValue) {
+    return fallback
+  }
+
+  const parsedDate = new Date(`${normalizedValue}T00:00:00`)
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return normalizedValue
+  }
+
+  return new Intl.DateTimeFormat('en', {
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+  }).format(parsedDate)
+}
+
 async function sendMail({ to, subject, text, html, attachments = [] }) {
   const from = getFromEmail()
 
@@ -511,7 +535,7 @@ async function sendSubElementApprovalRequest(
   const safeCostingId = getDisplayValue(costingId)
   const safeSubElementTitle = getDisplayValue(subElementTitle, 'Sub-element')
   const safeLink = getOptionalText(link)
-  const approvalPageUrl = `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/approve-sub-element/${encodeURIComponent(approvalToken)}`
+  const approvalPageUrl = getSubElementApprovalPageUrl(approvalToken)
   const intro = `A pilot has completed the sub-element "${safeSubElementTitle}" and is requesting your approval.`
   const notificationMessage = buildNotificationSummary([
     safeProjectDisplayName,
@@ -521,7 +545,6 @@ async function sendSubElementApprovalRequest(
     `A sub-element needs your approval: "${safeSubElementTitle}"`,
     '',
     `Project: ${safeProjectDisplayName}`,
-    `Costing ID: ${safeCostingId}`,
     `Pilot: ${safePilotName}`,
     safeLink ? `Link: ${safeLink}` : '',
     '',
@@ -544,7 +567,6 @@ async function sendSubElementApprovalRequest(
       <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
           ${renderDetailRow('Project', safeProjectDisplayName)}
-          ${renderDetailRow('Costing ID', safeCostingId)}
           ${renderDetailRow('Sub-element', safeSubElementTitle)}
           ${renderDetailRow('Pilot', safePilotName)}
           ${safeLink ? `
@@ -605,6 +627,148 @@ async function sendSubElementApprovalRequest(
   })
 }
 
+async function sendSubElementApprovalDeadlineReminderNotification({
+  approverEmail,
+  pilotName,
+  projectContext,
+  costingId,
+  costingType = null,
+  costingReference = null,
+  subElementKey = null,
+  subElementTitle,
+  dueDate,
+  daysRemaining,
+  approvalToken,
+  link = null,
+  notificationRecipients = null,
+}) {
+  if (!approverEmail || !approverEmail.trim()) {
+    throw new Error('Approver email is required to send approval deadline reminders.')
+  }
+
+  if (!approvalToken || !approvalToken.trim()) {
+    throw new Error('Approval token is required to send approval deadline reminders.')
+  }
+
+  const normalizedProjectContext = normalizeProjectContext(projectContext)
+  const safePilotName = getDisplayValue(pilotName, 'Not assigned')
+  const safeProjectDisplayName = normalizedProjectContext.project_display_name
+  const safeCostingId = getDisplayValue(costingId)
+  const safeCostingType = getDisplayValue(costingType, 'Costing')
+  const safeCostingReference = getOptionalText(costingReference)
+  const safeSubElementKey = getOptionalText(subElementKey)
+  const safeSubElementTitle = getDisplayValue(subElementTitle, 'Sub-element')
+  const safeLink = getOptionalText(link)
+  const safeDueDate = formatLongDate(dueDate)
+  const approvalPageUrl = getSubElementApprovalPageUrl(approvalToken)
+
+  let reminderLabel = 'Today is the deadline'
+  let eyebrow = 'Approval deadline today'
+  let title = 'Today is the deadline to approve this costing step'
+  let intro = `Today is the deadline to approve the step "${safeSubElementTitle}" in PL Assembly.`
+
+  if (daysRemaining === 2) {
+    reminderLabel = '2 days left'
+    eyebrow = 'Approval deadline in 2 days'
+    title = '2 days left to approve this costing step'
+    intro = `There are 2 days left to approve the step "${safeSubElementTitle}" in PL Assembly.`
+  } else if (daysRemaining === 1) {
+    reminderLabel = '1 day left'
+    eyebrow = 'Approval deadline tomorrow'
+    title = '1 day left to approve this costing step'
+    intro = `There is 1 day left to approve the step "${safeSubElementTitle}" in PL Assembly.`
+  }
+
+  const notificationMessage =
+    buildNotificationSummary([
+      safeProjectDisplayName ? `Project: ${safeProjectDisplayName}` : null,
+      safeCostingType ? `Stage: ${safeCostingType}` : null,
+      safeSubElementTitle ? `Step: ${safeSubElementTitle}` : null,
+      reminderLabel,
+    ]) || intro
+
+  const text = [
+    intro,
+    '',
+    `Project: ${safeProjectDisplayName}`,
+    `Stage: ${safeCostingType}`,
+    `Pilot: ${safePilotName}`,
+    `Step: ${safeSubElementTitle}`,
+    `Deadline: ${safeDueDate}`,
+    safeLink ? `Link: ${safeLink}` : '',
+    '',
+    'Please review this step and submit your approval decision before the deadline.',
+    approvalPageUrl,
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+  const html = renderEmailShell({
+    eyebrow,
+    title,
+    intro,
+    contentHtml: `
+      <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+          ${renderDetailRow('Project', safeProjectDisplayName)}
+          ${renderDetailRow('Stage', safeCostingType)}
+          ${renderDetailRow('Step', safeSubElementTitle)}
+          ${renderDetailRow('Pilot', safePilotName)}
+          ${renderDetailRow('Deadline', safeDueDate)}
+          ${safeLink ? `
+            <tr>
+              <td style="padding:0 0 12px 0;font-size:0.95rem;font-weight:700;color:#0a3452;vertical-align:top;width:112px;">${escapeHtml('Link')}</td>
+              <td style="padding:0 0 12px 0;font-size:0.98rem;color:#162231;"><a href="${escapeHtml(safeLink)}" style="color:#ef7807;text-decoration:underline;font-weight:700;" target="_blank">Click here to open the link</a></td>
+            </tr>
+          ` : ''}
+        </table>
+      </div>
+      <div style="margin-top:18px;border-radius:18px;background:#fff1df;border:1px solid rgba(239,120,7,0.24);padding:16px 18px;">
+        <p style="margin:0;font-size:1rem;line-height:1.6;color:#8a4b00;">
+          <strong>${escapeHtml(reminderLabel)}.</strong> This step is marked as done and is still waiting for your approval.
+        </p>
+      </div>
+    `,
+    actionLabel: 'Review & Approve',
+    actionUrl: approvalPageUrl,
+    footerNote: `
+      If the button does not work, copy this link into your browser:<br />
+      <a href="${approvalPageUrl}" style="color:#ef7807;text-decoration:none;font-weight:700;">${approvalPageUrl}</a>
+    `,
+  })
+
+  return sendMailWithNotification({
+    to: approverEmail,
+    subject: `PL Assembly - ${title}`,
+    text,
+    html,
+    attachments: getBrandLogoAttachment(),
+    notificationRecipients,
+    notification: {
+      type: 'sub-element-approval-deadline-reminder',
+      subject: `PL Assembly - ${title}`,
+      title,
+      message: notificationMessage,
+      body: null,
+      action_label: 'Review & Approve',
+      action_url: approvalPageUrl,
+      metadata: {
+        rfq_id: normalizedProjectContext.rfq_id,
+        project_display_name: safeProjectDisplayName,
+        costing_id: safeCostingId,
+        costing_reference: safeCostingReference,
+        costing_type: safeCostingType,
+        sub_element_key: safeSubElementKey,
+        sub_element_title: safeSubElementTitle,
+        pilot: safePilotName,
+        link: safeLink,
+        due_date: getOptionalText(dueDate),
+        days_remaining: Number.isInteger(daysRemaining) ? daysRemaining : null,
+      },
+    },
+  })
+}
+
 /*async function sendSubElementOpeningNotification(
   managerEmail,
   pilotName,
@@ -628,7 +792,6 @@ async function sendSubElementApprovalRequest(
     `The following step has been triggered after manager approval: "${safeSubElementTitle}"`,
     '',
     `Project: ${safeProjectDisplayName}`,
-    `Costing ID: ${safeCostingId}`,
     `Pilot: ${safePilotName}`,
     '',
     'Please open PL Assembly and complete this step.',
@@ -643,7 +806,6 @@ async function sendSubElementApprovalRequest(
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
           ${renderDetailRow('Triggered step', safeSubElementTitle)}
           ${renderDetailRow('Project', safeProjectDisplayName)}
-          ${renderDetailRow('Costing ID', safeCostingId)}
           ${renderDetailRow('Pilot', safePilotName)}
         </table>
       </div>
@@ -702,7 +864,6 @@ async function sendPilotAssignmentNotification(
     `You have been assigned to the following step: "${safeSubElementTitle}"`,
     '',
     `Project: ${safeProjectDisplayName}`,
-    `Costing ID: ${safeCostingId}`,
     '',
     'Please open PL Assembly and complete this step.',
   ].join('\n')
@@ -716,7 +877,6 @@ async function sendPilotAssignmentNotification(
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
           ${renderDetailRow('Assigned step', safeSubElementTitle)}
           ${renderDetailRow('Project', safeProjectDisplayName)}
-          ${renderDetailRow('Costing ID', safeCostingId)}
         </table>
       </div>
       <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
@@ -778,7 +938,6 @@ async function sendSubElementReadyToStartNotification(
     `You can now start your step: "${safeNextSubElementTitle}"`,
     '',
     `Project: ${safeProjectDisplayName}`,
-    `Costing ID: ${safeCostingId}`,
     '',
     'Please open PL Assembly and start your step.',
   ].join('\n')
@@ -793,7 +952,6 @@ async function sendSubElementReadyToStartNotification(
           ${renderDetailRow('Completed step', safeCompletedSubElementTitle)}
           ${renderDetailRow('Your step', safeNextSubElementTitle)}
           ${renderDetailRow('Project', safeProjectDisplayName)}
-          ${renderDetailRow('Costing ID', safeCostingId)}
         </table>
       </div>
       <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
@@ -826,6 +984,125 @@ async function sendSubElementReadyToStartNotification(
         completed_sub_element_title: safeCompletedSubElementTitle,
         sub_element_title: safeNextSubElementTitle,
         pilot: safePilotName,
+      },
+    },
+  })
+}
+
+async function sendSubElementDeadlineReminderNotification({
+  to = null,
+  pilotName,
+  projectContext,
+  costingId,
+  costingType,
+  costingReference = null,
+  subElementKey,
+  subElementTitle,
+  dueDate,
+  daysRemaining,
+  notificationRecipients = null,
+}) {
+  const normalizedProjectContext = normalizeProjectContext(projectContext)
+  const safePilotName = getDisplayValue(pilotName, 'Pilot')
+  const safeProjectDisplayName = normalizedProjectContext.project_display_name
+  const safeCostingId = getDisplayValue(costingId)
+  const safeCostingType = getDisplayValue(costingType, 'Costing')
+  const safeSubElementKey = getOptionalText(subElementKey)
+  const safeSubElementTitle = getDisplayValue(subElementTitle, 'Final step')
+  const safeDueDate = formatLongDate(dueDate)
+  const safeCostingReference = getOptionalText(costingReference)
+  const costingPageUrl = getWorkspaceCostingUrl()
+
+  let reminderLabel = 'Today is the deadline'
+  let eyebrow = 'Deadline today'
+  let title = 'Today is the deadline for your final costing step'
+  let intro = `Hello ${safePilotName}, today is the deadline for your final costing step in PL Assembly.`
+
+  if (daysRemaining === 2) {
+    reminderLabel = '2 days left'
+    eyebrow = 'Deadline in 2 days'
+    title = '2 days left before your final costing step deadline'
+    intro = `Hello ${safePilotName}, there are 2 days left before the deadline of your final costing step in PL Assembly.`
+  } else if (daysRemaining === 1) {
+    reminderLabel = '1 day left'
+    eyebrow = 'Deadline tomorrow'
+    title = '1 day left before your final costing step deadline'
+    intro = `Hello ${safePilotName}, there is 1 day left before the deadline of your final costing step in PL Assembly.`
+  }
+
+  const notificationMessage =
+    buildNotificationSummary([
+      safeProjectDisplayName ? `Project: ${safeProjectDisplayName}` : null,
+      safeCostingType ? `Stage: ${safeCostingType}` : null,
+      safeSubElementTitle ? `Step: ${safeSubElementTitle}` : null,
+      reminderLabel,
+    ]) || intro
+
+  const text = [
+    `Hello ${safePilotName},`,
+    '',
+    intro,
+    '',
+    `Project: ${safeProjectDisplayName}`,
+    `Stage: ${safeCostingType}`,
+    `Final step: ${safeSubElementTitle}`,
+    `Deadline: ${safeDueDate}`,
+    '',
+    'Please open PL Assembly and review this step.',
+  ].join('\n')
+
+  const html = renderEmailShell({
+    eyebrow,
+    title,
+    intro,
+    contentHtml: `
+      <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+          ${renderDetailRow('Stage', safeCostingType)}
+          ${renderDetailRow('Final step', safeSubElementTitle)}
+          ${renderDetailRow('Project', safeProjectDisplayName)}
+          ${renderDetailRow('Deadline', safeDueDate)}
+        </table>
+      </div>
+      <div style="margin-top:18px;border-radius:18px;background:#fff1df;border:1px solid rgba(239,120,7,0.24);padding:16px 18px;">
+        <p style="margin:0;font-size:1rem;line-height:1.6;color:#8a4b00;">
+          <strong>${escapeHtml(reminderLabel)}.</strong> Please make sure this final step is reviewed before the deadline.
+        </p>
+      </div>
+    `,
+    actionLabel: 'Open step',
+    actionUrl: costingPageUrl,
+  })
+
+  return sendMailWithNotification({
+    to,
+    subject: `PL Assembly - ${title}`,
+    text,
+    html,
+    attachments: getBrandLogoAttachment(),
+    notificationRecipients,
+    notification: {
+      type: 'sub-element-deadline-reminder',
+      subject: `PL Assembly - ${title}`,
+      title,
+      message: notificationMessage,
+      body: null,
+      action_label: 'Open step',
+      action_url: costingPageUrl,
+      metadata: {
+        action_type: 'open-step-conversation',
+        section_id: 'costing',
+        rfq_id: normalizedProjectContext.rfq_id,
+        project_display_name: safeProjectDisplayName,
+        costing_id: safeCostingId,
+        costing_reference: safeCostingReference,
+        costing_type: safeCostingType,
+        stage_label: safeCostingType,
+        sub_element_key: safeSubElementKey,
+        sub_element_title: safeSubElementTitle,
+        pilot: safePilotName,
+        due_date: getOptionalText(dueDate),
+        days_remaining: Number.isInteger(daysRemaining) ? daysRemaining : null,
       },
     },
   })
@@ -890,7 +1167,6 @@ async function sendSubElementStatusNotification(
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
           ${renderDetailRow('Step', safeSubElementTitle)}
           ${renderDetailRow('Project', safeProjectDisplayName)}
-          ${renderDetailRow('Costing ID', safeCostingId)}
           ${renderDetailRow('Pilot', safePilotName)}
           ${renderDetailRow('Status', `<span style="color:${statusColor};font-weight:700;">${escapeHtml(status)}</span>`)}
         </table>
@@ -908,7 +1184,6 @@ async function sendSubElementStatusNotification(
     '',
     `Step: "${safeSubElementTitle}"`,
     `Project: ${safeProjectDisplayName}`,
-    `Costing ID: ${safeCostingId}`,
     `Pilot: ${safePilotName}`,
     `Status: ${status}`,
     '',
@@ -948,7 +1223,9 @@ module.exports = {
   sendUserPasswordResetEmail,
   sendUserApprovalConfirmation,
   sendSubElementApprovalRequest,
+  sendSubElementApprovalDeadlineReminderNotification,
   sendPilotAssignmentNotification,
   sendSubElementReadyToStartNotification,
+  sendSubElementDeadlineReminderNotification,
   sendSubElementStatusNotification,
 }
