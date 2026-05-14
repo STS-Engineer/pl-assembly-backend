@@ -1,7 +1,8 @@
 const crypto = require('crypto')
-const { Op } = require('sequelize')
+const { Op, fn, col } = require('sequelize')
 const RfqCosting = require('../models/rfq-costing.model')
 const RfqCostingInitialSubElement = require('../models/rfq-costing-initial-sub-element.model')
+const SubElementConversationMessage = require('../models/sub-element-conversation-message.model')
 const emailService = require('../emails/email.service')
 const User = require('../models/user.model')
 const { getCostingDisplayData, getCostingDisplayDataMap } = require('./rfq-display.service')
@@ -165,6 +166,197 @@ function validateDeadlineAgainstCostingDueDate(deadlineValue, costingDueDateValu
 
 function createDateAtStartOfDay(date) {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate())
+}
+
+function parseDateAtStartOfDay(value) {
+  const normalizedValue = getTrimmedText(value)
+
+  if (!normalizedValue) {
+    return null
+  }
+
+  const parsedDate = new Date(normalizedValue)
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return null
+  }
+
+  parsedDate.setHours(0, 0, 0, 0)
+  return parsedDate
+}
+
+function isCompletedSubElementStatus(status) {
+  return normalizeLookupKey(status) === 'done'
+}
+
+function isLateSubElementStatus(status) {
+  const normalizedStatus = normalizeLookupKey(status)
+  return normalizedStatus === 'late' || normalizedStatus === 'late!'
+}
+
+function getEffectiveSubElementStatus(status, dueDate) {
+  const normalizedStatus = getTrimmedText(status)
+
+  if (isCompletedSubElementStatus(normalizedStatus)) {
+    return normalizedStatus || 'Done'
+  }
+
+  const parsedDueDate = parseDateAtStartOfDay(dueDate)
+
+  if (!parsedDueDate) {
+    return normalizedStatus
+  }
+
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+
+  return parsedDueDate < today ? 'Late!' : normalizedStatus
+}
+
+async function syncLateStatusIfNeeded(subElement) {
+  if (!subElement || typeof subElement !== 'object') {
+    return subElement
+  }
+
+  const rawSubElement =
+    subElement && typeof subElement.toJSON === 'function' ? subElement.toJSON() : subElement
+  const effectiveStatus = getEffectiveSubElementStatus(
+    rawSubElement?.status,
+    rawSubElement?.due_date,
+  )
+
+  if (effectiveStatus !== 'Late!' || isLateSubElementStatus(rawSubElement?.status)) {
+    return subElement
+  }
+
+  if (typeof subElement.update === 'function') {
+    await subElement.update({ status: 'Late!' })
+
+    if (typeof subElement.reload === 'function') {
+      await subElement.reload()
+    }
+
+    return subElement
+  }
+
+  return {
+    ...rawSubElement,
+    status: 'Late!',
+  }
+}
+
+function formatDateAtStartOfDay(date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'),
+  ].join('-')
+}
+
+function getTodayDateOnlyValue() {
+  return formatDateAtStartOfDay(createDateAtStartOfDay(new Date()))
+}
+
+function getConversationMessageLookupKey(costingId, subElementKey) {
+  const normalizedCostingId = normalizeOptionalInteger(costingId)
+  const normalizedSubElementKey = getTrimmedText(subElementKey)
+
+  if (!normalizedCostingId || !normalizedSubElementKey) {
+    return ''
+  }
+
+  return `${normalizedCostingId}:${normalizedSubElementKey}`
+}
+
+function getConversationMessageCountFromLookup(
+  conversationMessageCountsByLookupKey,
+  costingId,
+  subElementKey,
+) {
+  if (!(conversationMessageCountsByLookupKey instanceof Map)) {
+    return 0
+  }
+
+  const lookupKey = getConversationMessageLookupKey(costingId, subElementKey)
+
+  if (!lookupKey) {
+    return 0
+  }
+
+  const messageCount = conversationMessageCountsByLookupKey.get(lookupKey)
+  return Number.isInteger(messageCount) && messageCount >= 0 ? messageCount : 0
+}
+
+async function getConversationMessageCountLookupByCostingIds(costingIds = []) {
+  const normalizedCostingIds = Array.from(
+    new Set(
+      (Array.isArray(costingIds) ? costingIds : [])
+        .map((costingId) => normalizeOptionalInteger(costingId))
+        .filter(Boolean),
+    ),
+  )
+
+  if (normalizedCostingIds.length === 0) {
+    return new Map()
+  }
+
+  const rows = await SubElementConversationMessage.findAll({
+    where: {
+      rfq_costing_id: normalizedCostingIds,
+    },
+    attributes: [
+      'rfq_costing_id',
+      'sub_element_key',
+      [fn('COUNT', col('id')), 'message_count'],
+    ],
+    group: ['rfq_costing_id', 'sub_element_key'],
+    raw: true,
+  })
+
+  return rows.reduce((lookup, row) => {
+    const lookupKey = getConversationMessageLookupKey(
+      row?.rfq_costing_id,
+      row?.sub_element_key,
+    )
+    const messageCount = Number.parseInt(String(row?.message_count ?? '').trim(), 10)
+
+    if (lookupKey) {
+      lookup.set(lookupKey, Number.isInteger(messageCount) && messageCount >= 0 ? messageCount : 0)
+    }
+
+    return lookup
+  }, new Map())
+}
+
+async function syncLateStatusesByCostingIds(costingIds = []) {
+  const normalizedCostingIds = Array.from(
+    new Set(
+      (Array.isArray(costingIds) ? costingIds : [])
+        .map((costingId) => normalizeOptionalInteger(costingId))
+        .filter(Boolean),
+    ),
+  )
+
+  if (normalizedCostingIds.length === 0) {
+    return 0
+  }
+
+  const [updatedCount] = await RfqCostingInitialSubElement.update(
+    { status: 'Late!' },
+    {
+      where: {
+        rfq_costing_id: normalizedCostingIds,
+        due_date: {
+          [Op.lt]: getTodayDateOnlyValue(),
+        },
+        status: {
+          [Op.notIn]: ['Done', 'Late!'],
+        },
+      },
+    },
+  )
+
+  return updatedCount
 }
 
 function isWeekend(date) {
@@ -497,9 +689,22 @@ async function serializeSubElement(
   currentRole,
   approversByKey = null,
   costingDisplayData = null,
+  options = {},
 ) {
+  const normalizedOptions = options && typeof options === 'object' ? options : {}
+  const synchronizedSubElement =
+    normalizedOptions.skipLateStatusSync === true
+      ? subElement
+      : await syncLateStatusIfNeeded(subElement)
   const rawSubElement =
-    subElement && typeof subElement.toJSON === 'function' ? subElement.toJSON() : subElement || {}
+    synchronizedSubElement && typeof synchronizedSubElement.toJSON === 'function'
+      ? synchronizedSubElement.toJSON()
+      : synchronizedSubElement || {}
+  const conversationMessageCount = getConversationMessageCountFromLookup(
+    normalizedOptions.conversationMessageCountsByLookupKey,
+    rawSubElement.rfq_costing_id,
+    rawSubElement.key,
+  )
 
   const managers =
     approversByKey instanceof Map
@@ -513,12 +718,16 @@ async function serializeSubElement(
     title: rawSubElement.title,
     pilot: rawSubElement.pilot,
     approver: rawSubElement.approver,
-    status: rawSubElement.status,
+    status: getEffectiveSubElementStatus(rawSubElement.status, rawSubElement.due_date),
     approval_status: rawSubElement.approval_status,
     duration: rawSubElement.duration,
     due_date: rawSubElement.due_date,
     link: costingDisplayData?.costing_link || rawSubElement.link || null,
     design_type: rawSubElement.design_type,
+    conversation_message_count: conversationMessageCount,
+    conversationMessageCount: conversationMessageCount,
+    message_count: conversationMessageCount,
+    messageCount: conversationMessageCount,
     rfq_id: costingDisplayData?.rfq_id || null,
     project_display_name: costingDisplayData?.project_display_name || null,
     projectDisplayName: costingDisplayData?.project_display_name || null,
@@ -1595,16 +1804,26 @@ async function getSubElementsByCostingIds(costingIds, context = {}) {
       id: normalizedCostingIds,
       type: RfqCostingInitialSubElement.SUPPORTED_COSTING_TYPES,
     },
+    attributes: ['id', 'rfq_id', 'type', 'link'],
     order: [['id', 'ASC']],
   })
 
   const currentRole = getRequestedRole(context)
 
-  const [itemsByCostingId, costingDisplayDataById, approversByKey, metadata] = await Promise.all([
-    ensureDefaultSubElementsByCostingIds(costings.map((costing) => costing.id)),
+  const matchedCostingIds = costings.map((costing) => costing.id)
+  const [
+    itemsByCostingId,
+    costingDisplayDataById,
+    approversByKey,
+    metadata,
+    conversationMessageCountsByLookupKey,
+  ] = await Promise.all([
+    ensureDefaultSubElementsByCostingIds(matchedCostingIds),
     getCostingDisplayDataMap(costings),
     getApproversBySubElementKeyMap(),
     getOptions(),
+    getConversationMessageCountLookupByCostingIds(matchedCostingIds),
+    syncLateStatusesByCostingIds(matchedCostingIds),
   ])
 
   const serializedEntries = await Promise.all(
@@ -1620,6 +1839,10 @@ async function getSubElementsByCostingIds(costingIds, context = {}) {
             currentRole,
             approversByKey,
             costingDisplayDataById.get(costingKey) || null,
+            {
+              conversationMessageCountsByLookupKey,
+              skipLateStatusSync: true,
+            },
           )
         }),
       )
@@ -1638,9 +1861,11 @@ async function getSubElementsByCostingId(costingId, context = {}) {
   const costing = await getCostingWithSubElements(costingId)
   const costingDisplayData = await getCostingDisplayData(costing)
   const currentRole = getRequestedRole(context)
-  const [items, approversByKey] = await Promise.all([
+  const [items, approversByKey, conversationMessageCountsByLookupKey] = await Promise.all([
     ensureDefaultSubElements(costing.id),
     getApproversBySubElementKeyMap(),
+    getConversationMessageCountLookupByCostingIds([costing.id]),
+    syncLateStatusesByCostingIds([costing.id]),
   ])
 
   return {
@@ -1657,6 +1882,10 @@ async function getSubElementsByCostingId(costingId, context = {}) {
           currentRole,
           approversByKey,
           costingDisplayData,
+          {
+            conversationMessageCountsByLookupKey,
+            skipLateStatusSync: true,
+          },
         )
       })
     ),
@@ -1689,6 +1918,12 @@ async function getSubElementByKey(costingId, key, context = {}) {
     throw createHttpError(403, `The role "${currentRole}" is not allowed to view this sub-element.`)
   }
 
+  const [approversByKey, conversationMessageCountsByLookupKey] = await Promise.all([
+    getApproversBySubElementKeyMap(),
+    getConversationMessageCountLookupByCostingIds([costing.id]),
+    syncLateStatusesByCostingIds([costing.id]),
+  ])
+
   return {
     costing_id: costing.id,
     rfq_id: costing.rfq_id,
@@ -1698,8 +1933,12 @@ async function getSubElementByKey(costingId, key, context = {}) {
       item,
       template,
       currentRole,
-      await getApproversBySubElementKeyMap(),
+      approversByKey,
       costingDisplayData,
+      {
+        conversationMessageCountsByLookupKey,
+        skipLateStatusSync: true,
+      },
     ),
     metadata: buildSubElementDefinition(template),
   }
@@ -2226,6 +2465,11 @@ async function updateSubElementByKey(costingId, key, payload = {}) {
       currentRole,
       await getApproversBySubElementKeyMap(),
       costingDisplayData,
+      {
+        conversationMessageCountsByLookupKey: await getConversationMessageCountLookupByCostingIds([
+          costing.id,
+        ]),
+      },
     ),
     metadata: buildSubElementDefinition(template),
   }

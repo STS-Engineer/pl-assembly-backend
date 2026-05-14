@@ -265,11 +265,32 @@ async function getAllRfqs(options = {}) {
   const [rfqs, salesReps] = await Promise.all([
     Rfq.findAll({
       where: buildRfqArchiveWhereClause(options),
+      attributes: [
+        'rfq_id',
+        'rfq_data',
+        'created_by_email',
+        'is_archived',
+        'archived_at',
+        'createdAt',
+        'updatedAt',
+      ],
       include: [
         {
           model: RfqCosting,
           as: 'costings',
           required: false,
+          attributes: [
+            'id',
+            'rfq_id',
+            'type',
+            'product_family',
+            'plant',
+            'reference',
+            'due_date',
+            'link',
+            'createdAt',
+            'updatedAt',
+          ],
         },
       ],
       order: [

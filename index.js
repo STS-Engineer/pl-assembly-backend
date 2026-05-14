@@ -11,6 +11,8 @@ const Rfq = require('./models/rfq.model')
 const RfqCosting = require('./models/rfq-costing.model')
 const RfqCostingInitialSubElement = require('./models/rfq-costing-initial-sub-element.model')
 const SubElementConversationMessage = require('./models/sub-element-conversation-message.model')
+const ElementProductDesign = require('./models/element-product-design')
+const SubElementProductDesign = require('./models/sub-element-product-design')
 const ProductDevelopmentProduct = require('./models/product-development-product.model')
 const emailService = require('./emails/email.service')
 const rfqCostingInitialSubElementService = require('./services/rfq-costing-initial-sub-element.service')
@@ -72,6 +74,26 @@ RfqCosting.hasMany(SubElementConversationMessage, {
 SubElementConversationMessage.belongsTo(RfqCosting, {
   foreignKey: 'rfq_costing_id',
   as: 'costing',
+})
+
+ProductDevelopmentProduct.hasMany(ElementProductDesign, {
+  foreignKey: 'product_development_product_id',
+  as: 'elements',
+})
+
+ElementProductDesign.belongsTo(ProductDevelopmentProduct, {
+  foreignKey: 'product_development_product_id',
+  as: 'product',
+})
+
+ElementProductDesign.hasMany(SubElementProductDesign, {
+  foreignKey: 'element_product_design_id',
+  as: 'sub_elements',
+})
+
+SubElementProductDesign.belongsTo(ElementProductDesign, {
+  foreignKey: 'element_product_design_id',
+  as: 'element',
 })
 
 const app = express()
@@ -290,6 +312,31 @@ async function ensureProductDevelopmentArchiveColumns() {
   }
 }
 
+async function ensureProductDevelopmentConversationNullableColumns() {
+  const queryInterface = sequelize.getQueryInterface()
+  const tableName = SubElementConversationMessage.getTableName()
+  const existingTables = await queryInterface.showAllTables()
+  const normalizedTableNames = new Set(
+    existingTables
+      .map((tableEntry) => normalizeTableName(tableEntry))
+      .filter(Boolean),
+  )
+
+  if (!normalizedTableNames.has(tableName)) {
+    return
+  }
+
+  const tableDescription = await queryInterface.describeTable(tableName)
+
+  if (tableDescription?.rfq_costing_id?.allowNull === false) {
+    await sequelize.query(
+      `ALTER TABLE ${quoteIdentifier(tableName)} ALTER COLUMN ${quoteIdentifier(
+        'rfq_costing_id',
+      )} DROP NOT NULL`,
+    )
+  }
+}
+
 function closeServer() {
   if (!httpServer) {
     return Promise.resolve()
@@ -356,6 +403,7 @@ async function startServer() {
   await ensureRfqCostingDueDateColumn()
   await ensureRfqCostingSubElementDeadlineAlertColumns()
   await ensureProductDevelopmentArchiveColumns()
+  await ensureProductDevelopmentConversationNullableColumns()
   await sequelize.sync({ alter: true })
   console.log('Models synchronized successfully')
 

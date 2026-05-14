@@ -11,7 +11,7 @@ const SubElementConversationMessage = sequelize.define(
     },
     rfq_costing_id: {
       type: DataTypes.INTEGER,
-      allowNull: false,
+      allowNull: true,
       references: {
         model: 'rfq_costing',
         key: 'id',
@@ -21,7 +21,46 @@ const SubElementConversationMessage = sequelize.define(
     },
     sub_element_key: {
       type: DataTypes.STRING,
-      allowNull: false,
+      allowNull: true,
+    },
+    conversation_scope: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      defaultValue: 'costing-sub-element',
+    },
+    conversation_entity_id: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
+    product_development_product_id: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'product_development_products',
+        key: 'id',
+      },
+      onUpdate: 'CASCADE',
+      onDelete: 'CASCADE',
+    },
+    element_product_design_id: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'element-product-design',
+        key: 'id',
+      },
+      onUpdate: 'CASCADE',
+      onDelete: 'CASCADE',
+    },
+    sub_element_product_design_id: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+      references: {
+        model: 'sub-element-product-design',
+        key: 'id',
+      },
+      onUpdate: 'CASCADE',
+      onDelete: 'CASCADE',
     },
     user_id: {
       type: DataTypes.INTEGER,
@@ -70,6 +109,10 @@ const SubElementConversationMessage = sequelize.define(
       {
         name: 'idx_secm_created_at',
         fields: ['created_at'],
+      },
+      {
+        name: 'idx_secm_scope_entity',
+        fields: ['conversation_scope', 'conversation_entity_id'],
       },
     ],
   },

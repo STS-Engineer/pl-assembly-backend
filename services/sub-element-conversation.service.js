@@ -1,7 +1,11 @@
 const crypto = require('crypto')
+const { Op } = require('sequelize')
 const RfqCosting = require('../models/rfq-costing.model')
 const RfqCostingInitialSubElement = require('../models/rfq-costing-initial-sub-element.model')
 const SubElementConversationMessage = require('../models/sub-element-conversation-message.model')
+const ProductDevelopmentProduct = require('../models/product-development-product.model')
+const ElementProductDesign = require('../models/element-product-design')
+const SubElementProductDesign = require('../models/sub-element-product-design')
 const User = require('../models/user.model')
 const notificationService = require('./notification.service')
 const { getCostingDisplayData } = require('./rfq-display.service')
@@ -22,6 +26,9 @@ const CONVERSATION_CACHE_TTL_MS = Math.max(
 )
 const CONVERSATION_DEBUG_ENABLED =
   String(process.env.DEBUG_SUB_ELEMENT_CONVERSATIONS || '').trim().toLowerCase() === 'true'
+const COSTING_SUB_ELEMENT_CONVERSATION_SCOPE = 'costing-sub-element'
+const PRODUCT_DEVELOPMENT_ELEMENT_CONVERSATION_SCOPE = 'product-development-element'
+const PRODUCT_DEVELOPMENT_SUB_ELEMENT_CONVERSATION_SCOPE = 'product-development-sub-element'
 
 const initialCostingCache = new Map()
 const costingDisplayDataCache = new Map()
@@ -123,11 +130,25 @@ function getWorkspaceCostingUrl() {
   return `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/workspace/costing`
 }
 
+function getWorkspaceProductDevelopmentUrl() {
+  return `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/workspace/product-development`
+}
+
 function buildNotificationSummary(parts = []) {
   return parts
     .map((part) => getTrimmedText(part))
     .filter(Boolean)
     .join(' | ')
+}
+
+function normalizePositiveInteger(value, fieldLabel = 'Identifier') {
+  const parsedValue = Number.parseInt(String(value ?? '').trim(), 10)
+
+  if (!Number.isInteger(parsedValue) || parsedValue <= 0) {
+    throw createHttpError(400, `${fieldLabel} is invalid.`)
+  }
+
+  return parsedValue
 }
 
 function getIdentityLookupValues(source = {}) {
@@ -174,6 +195,28 @@ function isAdminUser(user = {}) {
 
 function getTemplateByKey(costingType, key) {
   return RfqCostingInitialSubElement.getTemplateByKey(costingType, getTrimmedText(key))
+}
+
+function buildCostingConversationMessageWhere(costingId, subElementKey) {
+  return {
+    rfq_costing_id: costingId,
+    sub_element_key: subElementKey,
+    [Op.or]: [
+      {
+        conversation_scope: null,
+      },
+      {
+        conversation_scope: COSTING_SUB_ELEMENT_CONVERSATION_SCOPE,
+      },
+    ],
+  }
+}
+
+function buildProductDevelopmentConversationMessageWhere(scope, entityId) {
+  return {
+    conversation_scope: scope,
+    conversation_entity_id: entityId,
+  }
 }
 
 async function getSupportedCosting(costingId) {
@@ -305,6 +348,95 @@ async function getConversationContext(costingId, key) {
     template,
     subElement,
     costingDisplayData,
+  }
+}
+
+async function getProductDevelopmentElementConversationContext(elementId) {
+  const normalizedElementId = normalizePositiveInteger(elementId, 'Element identifier')
+  const element = await ElementProductDesign.findByPk(normalizedElementId, {
+    attributes: [
+      'id',
+      'product_development_product_id',
+      'title',
+      'designer',
+      'leader',
+      'status',
+      'validation',
+    ],
+    include: [
+      {
+        model: ProductDevelopmentProduct,
+        as: 'product',
+        attributes: ['id', 'product_ref', 'product_name'],
+      },
+    ],
+  })
+
+  if (!element || !element.product) {
+    throw createHttpError(404, 'Product design element not found.')
+  }
+
+  return {
+    scope: PRODUCT_DEVELOPMENT_ELEMENT_CONVERSATION_SCOPE,
+    conversationEntityId: normalizedElementId,
+    product:
+      typeof element.product.toJSON === 'function' ? element.product.toJSON() : element.product,
+    element: typeof element.toJSON === 'function' ? element.toJSON() : element,
+    subElement: null,
+  }
+}
+
+async function getProductDevelopmentSubElementConversationContext(subElementId) {
+  const normalizedSubElementId = normalizePositiveInteger(subElementId, 'Sub-element identifier')
+  const subElement = await SubElementProductDesign.findByPk(normalizedSubElementId, {
+    attributes: [
+      'id',
+      'element_product_design_id',
+      'title',
+      'owner',
+      'validator',
+      'shared_to',
+      'status_element',
+      'validation',
+    ],
+    include: [
+      {
+        model: ElementProductDesign,
+        as: 'element',
+        attributes: [
+          'id',
+          'product_development_product_id',
+          'title',
+          'designer',
+          'leader',
+          'status',
+          'validation',
+        ],
+        include: [
+          {
+            model: ProductDevelopmentProduct,
+            as: 'product',
+            attributes: ['id', 'product_ref', 'product_name'],
+          },
+        ],
+      },
+    ],
+  })
+
+  if (!subElement?.element?.product) {
+    throw createHttpError(404, 'Product design sub-element not found.')
+  }
+
+  return {
+    scope: PRODUCT_DEVELOPMENT_SUB_ELEMENT_CONVERSATION_SCOPE,
+    conversationEntityId: normalizedSubElementId,
+    product:
+      typeof subElement.element.product.toJSON === 'function'
+        ? subElement.element.product.toJSON()
+        : subElement.element.product,
+    element:
+      typeof subElement.element.toJSON === 'function' ? subElement.element.toJSON() : subElement.element,
+    subElement: typeof subElement.toJSON === 'function' ? subElement.toJSON() : subElement,
   }
 }
 
@@ -493,7 +625,7 @@ function resolveMentionedUsers(message, users = [], authorUserId = null) {
   const mentionedUsersMap = new Map()
 
   normalizedUsers.forEach((user) => {
-    if (!Number.isInteger(user?.id) || user.id <= 0 || user.id === authorUserId) {
+    if (!Number.isInteger(user?.id) || user.id <= 0) {
       return
     }
 
@@ -546,8 +678,7 @@ function resolveMentionedUsersFromPayload(mentions, users = [], authorUserId = n
     if (
       !matchedUser ||
       !Number.isInteger(matchedUser.id) ||
-      matchedUser.id <= 0 ||
-      matchedUser.id === authorUserId
+      matchedUser.id <= 0
     ) {
       return
     }
@@ -608,6 +739,53 @@ async function resolveConversationParticipants(subElement, template, conversatio
   })
 }
 
+async function resolveProductDevelopmentConversationParticipants(
+  context,
+  conversationItems = [],
+) {
+  const users = await getApprovedUsers()
+  const participantsByKey = new Map()
+
+  addParticipant(
+    participantsByKey,
+    resolveUserReference(context?.element?.designer, users),
+    'designer',
+  )
+  addParticipant(participantsByKey, resolveUserReference(context?.element?.leader, users), 'leader')
+  addParticipant(
+    participantsByKey,
+    resolveUserReference(context?.subElement?.owner, users),
+    'owner',
+  )
+  addParticipant(
+    participantsByKey,
+    resolveUserReference(context?.subElement?.validator, users),
+    'validator',
+  )
+  addParticipant(
+    participantsByKey,
+    resolveUserReference(context?.subElement?.shared_to, users),
+    'shared-to',
+  )
+
+  ;(Array.isArray(conversationItems) ? conversationItems : []).forEach((item) => {
+    const rawItem = item && typeof item.toJSON === 'function' ? item.toJSON() : item || {}
+
+    normalizeStoredMentions(rawItem.mentions).forEach((mentionedUser) => {
+      addParticipantRecord(participantsByKey, mentionedUser, 'mentioned')
+    })
+  })
+
+  return Array.from(participantsByKey.values()).sort((leftParticipant, rightParticipant) => {
+    const leftLabel =
+      getTrimmedText(leftParticipant.full_name) || getTrimmedText(leftParticipant.email) || ''
+    const rightLabel =
+      getTrimmedText(rightParticipant.full_name) || getTrimmedText(rightParticipant.email) || ''
+
+    return leftLabel.localeCompare(rightLabel)
+  })
+}
+
 function assertConversationAccess(authenticatedUser, participants) {
   if (!authenticatedUser?.id) {
     throw createHttpError(401, 'Authentication is required.')
@@ -624,6 +802,12 @@ function assertConversationAccess(authenticatedUser, participants) {
 
   if (!hasAccess) {
     throw createHttpError(403, 'You are not allowed to access this step conversation.')
+  }
+}
+
+function assertAuthenticatedConversationAccess(authenticatedUser) {
+  if (!authenticatedUser?.id) {
+    throw createHttpError(401, 'Authentication is required.')
   }
 }
 
@@ -694,22 +878,30 @@ async function notifyMentionedUsers(mentionedUsers, context, authenticatedUser) 
     getTrimmedText(authenticatedUser?.full_name ?? authenticatedUser?.fullName) ||
     getTrimmedText(authenticatedUser?.email) ||
     'A colleague'
+  const rfqNumber =
+    getTrimmedText(context?.costingDisplayData?.reference) ||
+    getTrimmedText(context?.costingDisplayData?.rfq_id) ||
+    getTrimmedText(context?.costing?.rfq_id) ||
+    'N/A'
   const projectDisplayName =
     context?.costingDisplayData?.project_display_name || getTrimmedText(context?.costing?.rfq_id) || 'Project'
+  const rfqLabel = projectDisplayName || rfqNumber || 'RFQ'
   const costingType = getTrimmedText(context?.costing?.type) || 'Costing'
   const subElementTitle =
     getTrimmedText(context?.subElement?.title) || getTrimmedText(context?.template?.title) || 'Step'
   const notificationMessage =
     buildNotificationSummary([
-      projectDisplayName ? `Project: ${projectDisplayName}` : null,
+      `${authorName} mentioned you`,
+      rfqLabel ? `RFQ: ${rfqLabel}` : null,
       costingType ? `Stage: ${costingType}` : null,
       subElementTitle ? `Step: ${subElementTitle}` : null,
-    ]) || `${authorName} mentioned you in a message`
+      rfqNumber ? `Reference: ${rfqNumber}` : null,
+    ]) || `${authorName} mentioned you in RFQ ${rfqLabel}`
 
   return notificationService.createNotificationsForRecipients(validMentionedUsers, {
     type: 'conversation-mention',
-    subject: `PL Assembly - You were mentioned by ${authorName}`,
-    title: `You were mentioned by ${authorName}`,
+    subject: `PL Assembly - ${authorName} mentioned you in ${rfqLabel}`,
+    title: `${authorName} mentioned you`,
     message: notificationMessage,
     body: null,
     action_label: 'Open conversation',
@@ -718,6 +910,9 @@ async function notifyMentionedUsers(mentionedUsers, context, authenticatedUser) 
       action_type: 'open-step-conversation',
       section_id: 'costing',
       rfq_id: context?.costingDisplayData?.rfq_id || context?.costing?.rfq_id || null,
+      rfq_label: rfqLabel,
+      rfq_number: rfqNumber,
+      rfq_reference: rfqNumber,
       project_display_name: projectDisplayName,
       costing_id: context?.costing?.id ?? null,
       costing_reference: getTrimmedText(context?.costing?.reference) || null,
@@ -725,6 +920,71 @@ async function notifyMentionedUsers(mentionedUsers, context, authenticatedUser) 
       stage_label: costingType,
       sub_element_key: context?.template?.key || null,
       sub_element_title: subElementTitle,
+      author_id: authenticatedUser?.id ?? null,
+      author_name: authorName,
+    },
+  })
+}
+
+async function notifyMentionedUsersForProductDevelopment(
+  mentionedUsers,
+  context,
+  authenticatedUser,
+) {
+  const validMentionedUsers = Array.isArray(mentionedUsers) ? mentionedUsers : []
+
+  if (validMentionedUsers.length === 0) {
+    return {
+      created_count: 0,
+      skipped_count: 0,
+    }
+  }
+
+  const authorName =
+    getTrimmedText(authenticatedUser?.full_name ?? authenticatedUser?.fullName) ||
+    getTrimmedText(authenticatedUser?.email) ||
+    'A colleague'
+  const productRef = getTrimmedText(context?.product?.product_ref) || 'N/A'
+  const productName = getTrimmedText(context?.product?.product_name) || 'Product'
+  const productLabel = buildNotificationSummary([
+    productRef ? `Ref: ${productRef}` : null,
+    productName ? `Product: ${productName}` : null,
+  ]) || productName
+  const elementTitle = getTrimmedText(context?.element?.title) || 'Element'
+  const subElementTitle = getTrimmedText(context?.subElement?.title)
+  const scopeLabel =
+    context?.scope === PRODUCT_DEVELOPMENT_SUB_ELEMENT_CONVERSATION_SCOPE
+      ? 'Sub-element conversation'
+      : 'Element conversation'
+  const notificationMessage =
+    buildNotificationSummary([
+      `${authorName} mentioned you`,
+      productLabel,
+      elementTitle ? `Element: ${elementTitle}` : null,
+      subElementTitle ? `Sub-element: ${subElementTitle}` : null,
+    ]) || `${authorName} mentioned you in ${productName}`
+
+  return notificationService.createNotificationsForRecipients(validMentionedUsers, {
+    type: 'conversation-mention',
+    subject: `PL Assembly - ${authorName} mentioned you in ${productName}`,
+    title: `${authorName} mentioned you`,
+    message: notificationMessage,
+    body: null,
+    action_label: 'Open conversation',
+    action_url: getWorkspaceProductDevelopmentUrl(),
+    metadata: {
+      action_type: 'open-product-development-conversation',
+      section_id: 'product-development',
+      conversation_scope: context?.scope || PRODUCT_DEVELOPMENT_ELEMENT_CONVERSATION_SCOPE,
+      product_id: context?.product?.id ?? null,
+      product_ref: productRef || null,
+      product_name: productName || null,
+      product_label: productLabel,
+      element_id: context?.element?.id ?? null,
+      element_title: elementTitle,
+      sub_element_id: context?.subElement?.id ?? null,
+      sub_element_title: subElementTitle || null,
+      scope_label: scopeLabel,
       author_id: authenticatedUser?.id ?? null,
       author_name: authorName,
     },
@@ -1316,6 +1576,11 @@ function serializeConversationMessage(item, authorsById) {
     id: rawItem.id,
     rfq_costing_id: rawItem.rfq_costing_id,
     sub_element_key: rawItem.sub_element_key,
+    conversation_scope: rawItem.conversation_scope || COSTING_SUB_ELEMENT_CONVERSATION_SCOPE,
+    conversation_entity_id: rawItem.conversation_entity_id ?? null,
+    product_development_product_id: rawItem.product_development_product_id ?? null,
+    element_product_design_id: rawItem.element_product_design_id ?? null,
+    sub_element_product_design_id: rawItem.sub_element_product_design_id ?? null,
     message: rawItem.message || '',
     content_blocks: contentBlocks,
     mentions: normalizeStoredMentions(rawItem.mentions).map((mention) => ({
@@ -1375,6 +1640,41 @@ function buildConversationPayload({
   }
 }
 
+function buildProductDevelopmentConversationPayload({
+  scope,
+  product,
+  element,
+  subElement,
+  participants = [],
+}) {
+  const productRef = getTrimmedText(product?.product_ref)
+  const productName = getTrimmedText(product?.product_name)
+
+  return {
+    conversation_scope: scope,
+    product_id: product?.id ?? null,
+    product_ref: productRef || null,
+    product_name: productName || null,
+    product_label: buildNotificationSummary([
+      productRef ? `Ref: ${productRef}` : null,
+      productName ? `Product: ${productName}` : null,
+    ]) || productName || productRef || 'Product',
+    element_id: element?.id ?? null,
+    element_title: getTrimmedText(element?.title) || 'Element',
+    sub_element_id: subElement?.id ?? null,
+    sub_element_title: getTrimmedText(subElement?.title) || null,
+    status:
+      getTrimmedText(subElement?.status_element) ||
+      getTrimmedText(element?.status) ||
+      'Not requested',
+    validation:
+      getTrimmedText(subElement?.validation) ||
+      getTrimmedText(element?.validation) ||
+      'Not requested',
+    participants: participants.map((participant) => serializeParticipant(participant)),
+  }
+}
+
 async function getConversation(costingId, key, authenticatedUser) {
   debugConversationLog('[getConversation] Starting...', {
     costingId,
@@ -1391,14 +1691,16 @@ async function getConversation(costingId, key, authenticatedUser) {
     })
 
     const items = await SubElementConversationMessage.findAll({
-      where: {
-        rfq_costing_id: context.costing.id,
-        sub_element_key: context.template.key,
-      },
+      where: buildCostingConversationMessageWhere(context.costing.id, context.template.key),
       attributes: [
         'id',
         'rfq_costing_id',
         'sub_element_key',
+        'conversation_scope',
+        'conversation_entity_id',
+        'product_development_product_id',
+        'element_product_design_id',
+        'sub_element_product_design_id',
         'user_id',
         'message',
         'content',
@@ -1456,14 +1758,16 @@ async function getConversation(costingId, key, authenticatedUser) {
 async function createConversationMessage(costingId, key, payload = {}, authenticatedUser) {
   const context = await getConversationContext(costingId, key)
   const existingConversationItems = await SubElementConversationMessage.findAll({
-    where: {
-      rfq_costing_id: context.costing.id,
-      sub_element_key: context.template.key,
-    },
+    where: buildCostingConversationMessageWhere(context.costing.id, context.template.key),
     attributes: [
       'id',
       'rfq_costing_id',
       'sub_element_key',
+      'conversation_scope',
+      'conversation_entity_id',
+      'product_development_product_id',
+      'element_product_design_id',
+      'sub_element_product_design_id',
       'user_id',
       'message',
       'mentions',
@@ -1505,6 +1809,7 @@ async function createConversationMessage(costingId, key, payload = {}, authentic
   const createdItem = await SubElementConversationMessage.create({
     rfq_costing_id: context.costing.id,
     sub_element_key: context.template.key,
+    conversation_scope: COSTING_SUB_ELEMENT_CONVERSATION_SCOPE,
     user_id: authenticatedUser.id,
     message: normalizedPayload.message,
     content: normalizedPayload.content,
@@ -1591,14 +1896,16 @@ async function updateConversationMessage(
 
   const [existingConversationItems, targetMessage] = await Promise.all([
     SubElementConversationMessage.findAll({
-      where: {
-        rfq_costing_id: context.costing.id,
-        sub_element_key: context.template.key,
-      },
+      where: buildCostingConversationMessageWhere(context.costing.id, context.template.key),
       attributes: [
         'id',
         'rfq_costing_id',
         'sub_element_key',
+        'conversation_scope',
+        'conversation_entity_id',
+        'product_development_product_id',
+        'element_product_design_id',
+        'sub_element_product_design_id',
         'user_id',
         'message',
         'content',
@@ -1617,6 +1924,11 @@ async function updateConversationMessage(
         'id',
         'rfq_costing_id',
         'sub_element_key',
+        'conversation_scope',
+        'conversation_entity_id',
+        'product_development_product_id',
+        'element_product_design_id',
+        'sub_element_product_design_id',
         'user_id',
         'message',
         'content',
@@ -1642,7 +1954,11 @@ async function updateConversationMessage(
 
   if (
     Number(targetMessage.rfq_costing_id) !== Number(context.costing.id) ||
-    getTrimmedText(targetMessage.sub_element_key) !== getTrimmedText(context.template.key)
+    getTrimmedText(targetMessage.sub_element_key) !== getTrimmedText(context.template.key) ||
+    ![
+      '',
+      COSTING_SUB_ELEMENT_CONVERSATION_SCOPE,
+    ].includes(getTrimmedText(targetMessage.conversation_scope))
   ) {
     throw createHttpError(404, 'Conversation message not found in this step.')
   }
@@ -1732,14 +2048,16 @@ async function toggleConversationChecklistItem(
 
   const [existingConversationItems, targetMessage] = await Promise.all([
     SubElementConversationMessage.findAll({
-      where: {
-        rfq_costing_id: context.costing.id,
-        sub_element_key: context.template.key,
-      },
+      where: buildCostingConversationMessageWhere(context.costing.id, context.template.key),
       attributes: [
         'id',
         'rfq_costing_id',
         'sub_element_key',
+        'conversation_scope',
+        'conversation_entity_id',
+        'product_development_product_id',
+        'element_product_design_id',
+        'sub_element_product_design_id',
         'user_id',
         'message',
         'content',
@@ -1758,6 +2076,11 @@ async function toggleConversationChecklistItem(
         'id',
         'rfq_costing_id',
         'sub_element_key',
+        'conversation_scope',
+        'conversation_entity_id',
+        'product_development_product_id',
+        'element_product_design_id',
+        'sub_element_product_design_id',
         'user_id',
         'message',
         'content',
@@ -1783,7 +2106,11 @@ async function toggleConversationChecklistItem(
 
   if (
     Number(targetMessage.rfq_costing_id) !== Number(context.costing.id) ||
-    getTrimmedText(targetMessage.sub_element_key) !== getTrimmedText(context.template.key)
+    getTrimmedText(targetMessage.sub_element_key) !== getTrimmedText(context.template.key) ||
+    ![
+      '',
+      COSTING_SUB_ELEMENT_CONVERSATION_SCOPE,
+    ].includes(getTrimmedText(targetMessage.conversation_scope))
   ) {
     throw createHttpError(404, 'Conversation message not found in this step.')
   }
@@ -1808,9 +2135,430 @@ async function toggleConversationChecklistItem(
   }
 }
 
+async function getProductDevelopmentConversationItems(context) {
+  return SubElementConversationMessage.findAll({
+    where: buildProductDevelopmentConversationMessageWhere(
+      context.scope,
+      context.conversationEntityId,
+    ),
+    attributes: [
+      'id',
+      'rfq_costing_id',
+      'sub_element_key',
+      'conversation_scope',
+      'conversation_entity_id',
+      'product_development_product_id',
+      'element_product_design_id',
+      'sub_element_product_design_id',
+      'user_id',
+      'message',
+      'content',
+      'mentions',
+      'attachments',
+      'created_at',
+      'updated_at',
+    ],
+    order: [
+      ['created_at', 'ASC'],
+      ['id', 'ASC'],
+    ],
+    raw: true,
+  })
+}
+
+function isProductDevelopmentMessageInContext(targetMessage, context) {
+  return (
+    getTrimmedText(targetMessage?.conversation_scope) === getTrimmedText(context?.scope) &&
+    Number(targetMessage?.conversation_entity_id) === Number(context?.conversationEntityId)
+  )
+}
+
+async function getProductDevelopmentConversationByContext(context, authenticatedUser) {
+  assertAuthenticatedConversationAccess(authenticatedUser)
+  const items = await getProductDevelopmentConversationItems(context)
+  const participants = await resolveProductDevelopmentConversationParticipants(context, items)
+  const serializedItems = await serializeConversationMessages(items)
+
+  return {
+    conversation: buildProductDevelopmentConversationPayload({
+      ...context,
+      participants,
+    }),
+    items: serializedItems,
+    total_count: serializedItems.length,
+  }
+}
+
+async function createProductDevelopmentConversationMessageByContext(
+  context,
+  payload = {},
+  authenticatedUser,
+) {
+  assertAuthenticatedConversationAccess(authenticatedUser)
+
+  const normalizedPayload = normalizeMessagePayload(payload)
+  const approvedUsers = await getApprovedUsers()
+  const mentionedUsersFromPayload = resolveMentionedUsersFromPayload(
+    payload?.mentions,
+    approvedUsers,
+    authenticatedUser?.id ?? null,
+  )
+  const mentionedUsers = Array.from(
+    new Map(
+      [
+        ...mentionedUsersFromPayload,
+        ...resolveMentionedUsers(
+          normalizedPayload.message,
+          approvedUsers,
+          authenticatedUser?.id ?? null,
+        ),
+      ].map((mentionedUser) => [mentionedUser.id, mentionedUser]),
+    ).values(),
+  )
+
+  const createdItem = await SubElementConversationMessage.create({
+    rfq_costing_id: null,
+    sub_element_key: null,
+    conversation_scope: context.scope,
+    conversation_entity_id: context.conversationEntityId,
+    product_development_product_id: context.product?.id ?? null,
+    element_product_design_id: context.element?.id ?? null,
+    sub_element_product_design_id: context.subElement?.id ?? null,
+    user_id: authenticatedUser.id,
+    message: normalizedPayload.message,
+    content: normalizedPayload.content,
+    mentions: mentionedUsers.map((mentionedUser) => ({
+      id: mentionedUser.id,
+      full_name: mentionedUser.full_name,
+      email: mentionedUser.email,
+      role: mentionedUser.role,
+    })),
+    attachments: normalizedPayload.attachments,
+  })
+
+  const existingConversationItems = await getProductDevelopmentConversationItems(context)
+  const participants = await resolveProductDevelopmentConversationParticipants(
+    context,
+    existingConversationItems,
+  )
+  const [serializedItem] = await serializeConversationMessages([createdItem])
+
+  try {
+    await notifyMentionedUsersForProductDevelopment(mentionedUsers, context, authenticatedUser)
+  } catch (notificationError) {
+    console.error('[createProductDevelopmentConversationMessage] Failed to notify mentioned users:', {
+      message: notificationError.message,
+      scope: context.scope,
+      entityId: context.conversationEntityId,
+      authorUserId: authenticatedUser?.id,
+    })
+  }
+
+  return {
+    message: 'Conversation message sent successfully.',
+    conversation: buildProductDevelopmentConversationPayload({
+      ...context,
+      participants,
+    }),
+    item: serializedItem,
+  }
+}
+
+async function updateProductDevelopmentConversationMessageByContext(
+  context,
+  messageId,
+  payload = {},
+  authenticatedUser,
+) {
+  if (shouldHandleChecklistTogglePayload(payload)) {
+    return toggleProductDevelopmentConversationChecklistItemByContext(
+      context,
+      messageId,
+      payload,
+      authenticatedUser,
+    )
+  }
+
+  assertAuthenticatedConversationAccess(authenticatedUser)
+
+  const normalizedMessageId = Number.parseInt(String(messageId || '').trim(), 10)
+
+  if (!Number.isInteger(normalizedMessageId) || normalizedMessageId <= 0) {
+    throw createHttpError(400, 'Invalid conversation message identifier.')
+  }
+
+  const [existingConversationItems, targetMessage] = await Promise.all([
+    getProductDevelopmentConversationItems(context),
+    SubElementConversationMessage.findByPk(normalizedMessageId, {
+      attributes: [
+        'id',
+        'rfq_costing_id',
+        'sub_element_key',
+        'conversation_scope',
+        'conversation_entity_id',
+        'product_development_product_id',
+        'element_product_design_id',
+        'sub_element_product_design_id',
+        'user_id',
+        'message',
+        'content',
+        'mentions',
+        'attachments',
+        'created_at',
+        'updated_at',
+      ],
+    }),
+  ])
+
+  if (!targetMessage || !isProductDevelopmentMessageInContext(targetMessage, context)) {
+    throw createHttpError(404, 'Conversation message not found in this product design item.')
+  }
+
+  assertConversationMessageEditAccess(targetMessage, authenticatedUser)
+
+  const normalizedPayload = normalizeMessagePayload(payload)
+  const approvedUsers = await getApprovedUsers()
+  const previousMentionIds = new Set(
+    normalizeStoredMentions(targetMessage?.mentions).map((mention) => mention.id),
+  )
+  const mentionedUsersFromPayload = resolveMentionedUsersFromPayload(
+    payload?.mentions,
+    approvedUsers,
+    authenticatedUser?.id ?? null,
+  )
+  const mentionedUsers = Array.from(
+    new Map(
+      [
+        ...mentionedUsersFromPayload,
+        ...resolveMentionedUsers(
+          normalizedPayload.message,
+          approvedUsers,
+          authenticatedUser?.id ?? null,
+        ),
+      ].map((mentionedUser) => [mentionedUser.id, mentionedUser]),
+    ).values(),
+  )
+
+  await targetMessage.update({
+    message: normalizedPayload.message,
+    content: normalizedPayload.content,
+    mentions: mentionedUsers.map((mentionedUser) => ({
+      id: mentionedUser.id,
+      full_name: mentionedUser.full_name,
+      email: mentionedUser.email,
+      role: mentionedUser.role,
+    })),
+    attachments: normalizedPayload.attachments,
+  })
+
+  const updatedConversationItems = existingConversationItems.map((item) =>
+    Number(item?.id) === normalizedMessageId ? targetMessage : item,
+  )
+  const participants = await resolveProductDevelopmentConversationParticipants(
+    context,
+    updatedConversationItems,
+  )
+  const [serializedItem] = await serializeConversationMessages([targetMessage])
+  const newlyMentionedUsers = mentionedUsers.filter(
+    (mentionedUser) => !previousMentionIds.has(mentionedUser.id),
+  )
+
+  try {
+    await notifyMentionedUsersForProductDevelopment(
+      newlyMentionedUsers,
+      context,
+      authenticatedUser,
+    )
+  } catch (notificationError) {
+    console.error('[updateProductDevelopmentConversationMessage] Failed to notify mentioned users:', {
+      message: notificationError.message,
+      scope: context.scope,
+      entityId: context.conversationEntityId,
+      messageId: normalizedMessageId,
+      authorUserId: authenticatedUser?.id,
+    })
+  }
+
+  return {
+    message: 'Conversation message updated successfully.',
+    conversation: buildProductDevelopmentConversationPayload({
+      ...context,
+      participants,
+    }),
+    item: serializedItem,
+  }
+}
+
+async function toggleProductDevelopmentConversationChecklistItemByContext(
+  context,
+  messageId,
+  payload = {},
+  authenticatedUser,
+) {
+  assertAuthenticatedConversationAccess(authenticatedUser)
+
+  const normalizedMessageId = Number.parseInt(String(messageId || '').trim(), 10)
+
+  if (!Number.isInteger(normalizedMessageId) || normalizedMessageId <= 0) {
+    throw createHttpError(400, 'Invalid conversation message identifier.')
+  }
+
+  const [existingConversationItems, targetMessage] = await Promise.all([
+    getProductDevelopmentConversationItems(context),
+    SubElementConversationMessage.findByPk(normalizedMessageId, {
+      attributes: [
+        'id',
+        'rfq_costing_id',
+        'sub_element_key',
+        'conversation_scope',
+        'conversation_entity_id',
+        'product_development_product_id',
+        'element_product_design_id',
+        'sub_element_product_design_id',
+        'user_id',
+        'message',
+        'content',
+        'mentions',
+        'attachments',
+        'created_at',
+        'updated_at',
+      ],
+    }),
+  ])
+
+  if (!targetMessage || !isProductDevelopmentMessageInContext(targetMessage, context)) {
+    throw createHttpError(404, 'Conversation message not found in this product design item.')
+  }
+
+  const nextContent = resolveChecklistToggleNextContent(targetMessage, payload)
+  const nextMessage = buildConversationMessageFromContentBlocks(nextContent)
+
+  await targetMessage.update({
+    message: nextMessage,
+    content: nextContent,
+  })
+
+  const participants = await resolveProductDevelopmentConversationParticipants(
+    context,
+    existingConversationItems,
+  )
+  const [serializedItem] = await serializeConversationMessages([targetMessage])
+
+  return {
+    message: 'Checklist item updated successfully.',
+    conversation: buildProductDevelopmentConversationPayload({
+      ...context,
+      participants,
+    }),
+    item: serializedItem,
+  }
+}
+
+async function getProductDevelopmentElementConversation(elementId, authenticatedUser) {
+  return getProductDevelopmentConversationByContext(
+    await getProductDevelopmentElementConversationContext(elementId),
+    authenticatedUser,
+  )
+}
+
+async function createProductDevelopmentElementConversationMessage(
+  elementId,
+  payload = {},
+  authenticatedUser,
+) {
+  return createProductDevelopmentConversationMessageByContext(
+    await getProductDevelopmentElementConversationContext(elementId),
+    payload,
+    authenticatedUser,
+  )
+}
+
+async function updateProductDevelopmentElementConversationMessage(
+  elementId,
+  messageId,
+  payload = {},
+  authenticatedUser,
+) {
+  return updateProductDevelopmentConversationMessageByContext(
+    await getProductDevelopmentElementConversationContext(elementId),
+    messageId,
+    payload,
+    authenticatedUser,
+  )
+}
+
+async function toggleProductDevelopmentElementConversationChecklistItem(
+  elementId,
+  messageId,
+  payload = {},
+  authenticatedUser,
+) {
+  return toggleProductDevelopmentConversationChecklistItemByContext(
+    await getProductDevelopmentElementConversationContext(elementId),
+    messageId,
+    payload,
+    authenticatedUser,
+  )
+}
+
+async function getProductDevelopmentSubElementConversation(subElementId, authenticatedUser) {
+  return getProductDevelopmentConversationByContext(
+    await getProductDevelopmentSubElementConversationContext(subElementId),
+    authenticatedUser,
+  )
+}
+
+async function createProductDevelopmentSubElementConversationMessage(
+  subElementId,
+  payload = {},
+  authenticatedUser,
+) {
+  return createProductDevelopmentConversationMessageByContext(
+    await getProductDevelopmentSubElementConversationContext(subElementId),
+    payload,
+    authenticatedUser,
+  )
+}
+
+async function updateProductDevelopmentSubElementConversationMessage(
+  subElementId,
+  messageId,
+  payload = {},
+  authenticatedUser,
+) {
+  return updateProductDevelopmentConversationMessageByContext(
+    await getProductDevelopmentSubElementConversationContext(subElementId),
+    messageId,
+    payload,
+    authenticatedUser,
+  )
+}
+
+async function toggleProductDevelopmentSubElementConversationChecklistItem(
+  subElementId,
+  messageId,
+  payload = {},
+  authenticatedUser,
+) {
+  return toggleProductDevelopmentConversationChecklistItemByContext(
+    await getProductDevelopmentSubElementConversationContext(subElementId),
+    messageId,
+    payload,
+    authenticatedUser,
+  )
+}
+
 module.exports = {
   getConversation,
   createConversationMessage,
   updateConversationMessage,
   toggleConversationChecklistItem,
+  getProductDevelopmentElementConversation,
+  createProductDevelopmentElementConversationMessage,
+  updateProductDevelopmentElementConversationMessage,
+  toggleProductDevelopmentElementConversationChecklistItem,
+  getProductDevelopmentSubElementConversation,
+  createProductDevelopmentSubElementConversationMessage,
+  updateProductDevelopmentSubElementConversationMessage,
+  toggleProductDevelopmentSubElementConversationChecklistItem,
 }
