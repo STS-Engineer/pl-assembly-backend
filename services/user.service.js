@@ -309,7 +309,17 @@ async function signUp(payload) {
 
 async function signIn(payload) {
   const user = await User.signIn(payload)
-  return buildAuthResponse('Connexion reussie.', user)
+  const authResponse = buildAuthResponse('Connexion reussie.', user)
+  
+  // Log pour déboguer
+  console.log('[AUTH SERVICE] signIn response:', {
+    hasAccessToken: !!authResponse.accessToken,
+    hasUser: !!authResponse.user,
+    keys: Object.keys(authResponse),
+    response: authResponse,
+  })
+  
+  return authResponse
 }
 
 async function approveUserAccount(token) {
