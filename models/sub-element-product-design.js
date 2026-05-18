@@ -107,12 +107,20 @@ const SubElementProductDesign = sequelize.define(
       allowNull: true,
       defaultValue: 'Not requested',
     },
+    date_of_sharing: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
     comment_change_index: {
       type: DataTypes.TEXT,
       allowNull: true,
     },
     number_hours: {
       type: DataTypes.INTEGER,
+      allowNull: true,
+    },
+    cost: {
+      type: DataTypes.DECIMAL(12, 2),
       allowNull: true,
     },
   },

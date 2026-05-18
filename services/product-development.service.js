@@ -206,6 +206,34 @@ function normalizeOptionalInteger(value, options = {}) {
   return parsedValue
 }
 
+function normalizeOptionalDecimal(value, options = {}) {
+  const fieldLabel = options.fieldLabel || 'Decimal value'
+  const minValue = Number.isFinite(options.min) ? options.min : null
+
+  if (value === undefined || value === null || getTrimmedText(value) === '') {
+    return null
+  }
+
+  const rawValue = String(value).trim()
+
+  if (!/^-?\d+(?:[.,]\d+)?$/.test(rawValue)) {
+    throw createHttpError(400, `${fieldLabel} must be a valid number.`)
+  }
+
+  const normalizedValue = rawValue.replace(',', '.')
+  const parsedValue = Number.parseFloat(normalizedValue)
+
+  if (!Number.isFinite(parsedValue)) {
+    throw createHttpError(400, `${fieldLabel} must be a valid number.`)
+  }
+
+  if (minValue !== null && parsedValue < minValue) {
+    throw createHttpError(400, `${fieldLabel} must be greater than or equal to ${minValue}.`)
+  }
+
+  return Number(parsedValue.toFixed(2))
+}
+
 function normalizeOptionalIterationTime(value) {
   if (value === undefined || value === null || getTrimmedText(value) === '') {
     return null
@@ -287,6 +315,30 @@ function normalizeSubElementTitle(value) {
   return normalizeRequiredText(value, 'Sub-element title')
 }
 
+function normalizeSubElementIndex(value, options = {}) {
+  const defaultValue = options.defaultValue ?? null
+  const allowNull = options.allowNull !== false
+  const normalizedValue = getTrimmedText(value).toUpperCase()
+
+  if (!normalizedValue) {
+    if (defaultValue) {
+      return defaultValue
+    }
+
+    if (allowNull) {
+      return null
+    }
+
+    throw createHttpError(400, 'Sub-element index is required.')
+  }
+
+  if (!/^[A-Z]+$/.test(normalizedValue)) {
+    throw createHttpError(400, 'Sub-element index must contain only letters like A, B or AA.')
+  }
+
+  return normalizedValue
+}
+
 function isNeutralSubElementStatusValue(value, fallback = 'Not requested') {
   const normalizedValue = getTrimmedText(value).toLowerCase()
   return !normalizedValue || normalizedValue === getTrimmedText(fallback).toLowerCase()
@@ -337,6 +389,16 @@ function pickPreferredSubElementInteger(primaryValue, secondaryValue) {
   return getOptionalInteger(secondaryValue)
 }
 
+function pickPreferredSubElementDecimal(primaryValue, secondaryValue) {
+  const normalizedPrimaryValue = getOptionalDecimal(primaryValue)
+
+  if (normalizedPrimaryValue !== null) {
+    return normalizedPrimaryValue
+  }
+
+  return getOptionalDecimal(secondaryValue)
+}
+
 function getDefaultSubElementTitlesForElementTitle(title) {
   return DEFAULT_PRODUCT_SUB_ELEMENT_TEMPLATES[getTrimmedText(title).toLowerCase()] || []
 }
@@ -347,11 +409,13 @@ function buildDefaultSubElementsPayload(elementId, elementTitle) {
     title,
     display_order: index + 1,
     is_default: true,
-    index: String(index + 1).padStart(2, '0'),
+    index: null,
     two_d_status: 'Not requested',
     status_element: 'Not requested',
     validation: 'Not requested',
     shared_to: 'Not requested',
+    date_of_sharing: null,
+    cost: null,
   }))
 }
 
@@ -501,7 +565,6 @@ async function reconcileSamplesPrototypesSubElements(elements = [], options = {}
 
     if (Number.isInteger(nextDisplayOrder) && nextDisplayOrder !== primarySubElement.display_order) {
       mergedUpdateData.display_order = nextDisplayOrder
-      mergedUpdateData.index = String(nextDisplayOrder).padStart(2, '0')
     }
 
     redundantSubElements.forEach((subElement) => {
@@ -525,6 +588,10 @@ async function reconcileSamplesPrototypesSubElements(elements = [], options = {}
         mergedUpdateData.output ?? primarySubElement.output,
         subElement.output,
       )
+      mergedUpdateData.date_of_sharing = pickPreferredSubElementText(
+        mergedUpdateData.date_of_sharing ?? primarySubElement.date_of_sharing,
+        subElement.date_of_sharing,
+      )
       mergedUpdateData.comment_change_index = pickPreferredSubElementText(
         mergedUpdateData.comment_change_index ?? primarySubElement.comment_change_index,
         subElement.comment_change_index,
@@ -540,6 +607,10 @@ async function reconcileSamplesPrototypesSubElements(elements = [], options = {}
       mergedUpdateData.number_hours = pickPreferredSubElementInteger(
         mergedUpdateData.number_hours ?? primarySubElement.number_hours,
         subElement.number_hours,
+      )
+      mergedUpdateData.cost = pickPreferredSubElementDecimal(
+        mergedUpdateData.cost ?? primarySubElement.cost,
+        subElement.cost,
       )
       mergedUpdateData.two_d_status = pickPreferredSubElementStatus(
         mergedUpdateData.two_d_status ?? primarySubElement.two_d_status,
@@ -630,6 +701,15 @@ function getOptionalInteger(value) {
 
   const parsedValue = Number.parseInt(String(value), 10)
   return Number.isInteger(parsedValue) ? parsedValue : null
+}
+
+function getOptionalDecimal(value) {
+  if (value === undefined || value === null || value === '') {
+    return null
+  }
+
+  const parsedValue = Number.parseFloat(String(value).trim().replace(',', '.'))
+  return Number.isFinite(parsedValue) ? Number(parsedValue.toFixed(2)) : null
 }
 
 function buildConversationMessageCountLookupKey(scope, entityId) {
@@ -727,6 +807,10 @@ function serializeSubElement(subElement, options = {}) {
   const rawSubElement =
     subElement && typeof subElement.toJSON === 'function' ? subElement.toJSON() : subElement || {}
   const displayOrder = getOptionalInteger(rawSubElement.display_order) ?? 0
+  const storedIndex = getTrimmedText(rawSubElement.index)
+  const normalizedIndex = /^[A-Za-z]+$/.test(storedIndex) ? storedIndex.toUpperCase() : null
+  const dateOfSharing = formatOptionalDateOnly(rawSubElement.date_of_sharing)
+  const cost = getOptionalDecimal(rawSubElement.cost)
   const conversationMessageCount = getConversationMessageCountFromLookup(
     options.conversationMessageCountsByKey,
     PRODUCT_DEVELOPMENT_SUB_ELEMENT_CONVERSATION_SCOPE,
@@ -742,7 +826,7 @@ function serializeSubElement(subElement, options = {}) {
     displayOrder,
     is_default: Boolean(rawSubElement.is_default),
     isDefault: Boolean(rawSubElement.is_default),
-    index: getTrimmedText(rawSubElement.index) || String(displayOrder).padStart(2, '0'),
+    index: normalizedIndex,
     owner: getTrimmedText(rawSubElement.owner) || null,
     two_d: typeof rawSubElement.two_d === 'boolean' ? rawSubElement.two_d : null,
     twoD: typeof rawSubElement.two_d === 'boolean' ? rawSubElement.two_d : null,
@@ -759,10 +843,13 @@ function serializeSubElement(subElement, options = {}) {
     output: getTrimmedText(rawSubElement.output) || null,
     shared_to: getTrimmedText(rawSubElement.shared_to) || 'Not requested',
     sharedTo: getTrimmedText(rawSubElement.shared_to) || 'Not requested',
+    date_of_sharing: dateOfSharing,
+    dateOfSharing,
     comment_change_index: getTrimmedText(rawSubElement.comment_change_index) || null,
     commentChangeIndex: getTrimmedText(rawSubElement.comment_change_index) || null,
     number_hours: getOptionalInteger(rawSubElement.number_hours),
     numberHours: getOptionalInteger(rawSubElement.number_hours),
+    cost,
     conversation_message_count: conversationMessageCount,
     conversationMessageCount: conversationMessageCount,
     message_count: conversationMessageCount,
@@ -1583,7 +1670,7 @@ async function createProductSubElement(productId, elementId, payload) {
     title,
     display_order: nextDisplayOrder,
     is_default: false,
-    index: String(nextDisplayOrder).padStart(2, '0'),
+    index: normalizeSubElementIndex(payload?.index),
     owner: normalizeOptionalText(payload?.owner),
     two_d: normalizeNullableBoolean(payload?.two_d ?? payload?.twoD, '2D'),
     three_d: normalizeNullableBoolean(payload?.three_d ?? payload?.threeD, '3D'),
@@ -1623,11 +1710,16 @@ async function createProductSubElement(productId, elementId, payload) {
         allowNull: false,
       },
     ),
+    date_of_sharing: normalizeOptionalDate(payload?.date_of_sharing ?? payload?.dateOfSharing),
     comment_change_index: normalizeOptionalText(
       payload?.comment_change_index ?? payload?.commentChangeIndex,
     ),
     number_hours: normalizeOptionalInteger(payload?.number_hours ?? payload?.numberHours, {
       fieldLabel: 'Number of hours',
+      min: 0,
+    }),
+    cost: normalizeOptionalDecimal(payload?.cost, {
+      fieldLabel: 'Cost',
       min: 0,
     }),
   })
@@ -1950,7 +2042,6 @@ async function updateProductSubElement(productId, elementId, subElementId, paylo
         fieldLabel: 'Display order',
         min: 0,
       }) ?? 0
-    updateData.index = String(updateData.display_order).padStart(2, '0')
   }
 
   if (hasOwnPayloadField(payload, 'is_default') || hasOwnPayloadField(payload, 'isDefault')) {
@@ -1958,7 +2049,7 @@ async function updateProductSubElement(productId, elementId, subElementId, paylo
   }
 
   if (hasOwnPayloadField(payload, 'index')) {
-    updateData.index = normalizeOptionalText(payload?.index)
+    updateData.index = normalizeSubElementIndex(payload?.index)
   }
 
   if (hasOwnPayloadField(payload, 'owner')) {
@@ -2037,6 +2128,15 @@ async function updateProductSubElement(productId, elementId, subElementId, paylo
   }
 
   if (
+    hasOwnPayloadField(payload, 'date_of_sharing') ||
+    hasOwnPayloadField(payload, 'dateOfSharing')
+  ) {
+    updateData.date_of_sharing = normalizeOptionalDate(
+      payload?.date_of_sharing ?? payload?.dateOfSharing,
+    )
+  }
+
+  if (
     hasOwnPayloadField(payload, 'comment_change_index') ||
     hasOwnPayloadField(payload, 'commentChangeIndex')
   ) {
@@ -2053,6 +2153,13 @@ async function updateProductSubElement(productId, elementId, subElementId, paylo
         min: 0,
       },
     )
+  }
+
+  if (hasOwnPayloadField(payload, 'cost')) {
+    updateData.cost = normalizeOptionalDecimal(payload?.cost, {
+      fieldLabel: 'Cost',
+      min: 0,
+    })
   }
 
   if (Object.keys(updateData).length === 0) {
@@ -2122,19 +2229,14 @@ async function resequenceElementSubElements(elementId, options = {}) {
 
   for (const [index, subElement] of subElements.entries()) {
     const nextDisplayOrder = index + 1
-    const nextIndex = String(nextDisplayOrder).padStart(2, '0')
 
-    if (
-      getOptionalInteger(subElement.display_order) === nextDisplayOrder &&
-      getTrimmedText(subElement.index) === nextIndex
-    ) {
+    if (getOptionalInteger(subElement.display_order) === nextDisplayOrder) {
       continue
     }
 
     await subElement.update(
       {
         display_order: nextDisplayOrder,
-        index: nextIndex,
       },
       {
         ...(options.transaction ? { transaction: options.transaction } : {}),
