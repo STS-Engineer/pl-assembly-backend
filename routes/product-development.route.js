@@ -6,7 +6,11 @@ const {
   createProductElement,
   createProductSubElement,
   createSubElementConversationMessage,
+  deleteElement,
   deleteProduct,
+  deleteProductElement,
+  deleteProductSubElement,
+  deleteSubElement,
   getElementConversation,
   getAllProducts,
   getSubElementConversation,
@@ -24,6 +28,7 @@ const {
 
 router.get('/products', getAllProducts)
 router.post('/products', createProduct)
+router.delete('/elements/:elementId', deleteElement)
 router.patch('/elements/:elementId', updateElement)
 router.get('/elements/:elementId/conversation', getElementConversation)
 router.post('/elements/:elementId/conversation', createElementConversationMessage)
@@ -43,9 +48,12 @@ router.patch(
   '/sub-elements/:subElementId/conversation/:messageId/checklist',
   toggleSubElementConversationChecklistItem,
 )
+router.delete('/sub-elements/:subElementId', deleteSubElement)
 router.post('/products/:id/elements', createProductElement)
 router.post('/products/:id/elements/:elementId/sub-elements', createProductSubElement)
+router.delete('/products/:id/elements/:elementId/sub-elements/:subElementId', deleteProductSubElement)
 router.patch('/products/:id/elements/:elementId/sub-elements/:subElementId', updateProductSubElement)
+router.delete('/products/:id/elements/:elementId', deleteProductElement)
 router.patch('/products/:id/elements/:elementId', updateProductElement)
 router.patch('/products/:id', updateProduct)
 router.post('/products/:id/archive', archiveProduct)

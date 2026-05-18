@@ -111,6 +111,49 @@ async function updateSubElement(req, res) {
   }
 }
 
+async function deleteProductElement(req, res) {
+  try {
+    const product = await productDevelopmentService.deleteProductElement(
+      req.params.id,
+      req.params.elementId,
+    )
+    res.status(200).json(product)
+  } catch (error) {
+    handleControllerError(res, error)
+  }
+}
+
+async function deleteElement(req, res) {
+  try {
+    const product = await productDevelopmentService.deleteElement(req.params.elementId)
+    res.status(200).json(product)
+  } catch (error) {
+    handleControllerError(res, error)
+  }
+}
+
+async function deleteProductSubElement(req, res) {
+  try {
+    const product = await productDevelopmentService.deleteProductSubElement(
+      req.params.id,
+      req.params.elementId,
+      req.params.subElementId,
+    )
+    res.status(200).json(product)
+  } catch (error) {
+    handleControllerError(res, error)
+  }
+}
+
+async function deleteSubElement(req, res) {
+  try {
+    const product = await productDevelopmentService.deleteSubElement(req.params.subElementId)
+    res.status(200).json(product)
+  } catch (error) {
+    handleControllerError(res, error)
+  }
+}
+
 async function updateProduct(req, res) {
   try {
     const product = await productDevelopmentService.updateProduct(req.params.id, req.body)
@@ -276,6 +319,10 @@ module.exports = {
   updateElement,
   updateProductSubElement,
   updateSubElement,
+  deleteProductElement,
+  deleteElement,
+  deleteProductSubElement,
+  deleteSubElement,
   updateProduct,
   deleteProduct,
   archiveProduct,

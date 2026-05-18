@@ -2074,6 +2074,126 @@ async function updateSubElement(subElementId, payload) {
   return updateProductSubElement(productId, elementId, subElement.id, payload)
 }
 
+async function resequenceProductElements(productId, options = {}) {
+  const normalizedProductId = normalizeProductIdentifier(productId)
+  const elements = await ElementProductDesign.findAll({
+    where: {
+      product_development_product_id: normalizedProductId,
+    },
+    order: [
+      ['display_order', 'ASC'],
+      ['created_at', 'ASC'],
+      ['id', 'ASC'],
+    ],
+    ...(options.transaction ? { transaction: options.transaction } : {}),
+  })
+
+  for (const [index, element] of elements.entries()) {
+    const nextDisplayOrder = index + 1
+
+    if (getOptionalInteger(element.display_order) === nextDisplayOrder) {
+      continue
+    }
+
+    await element.update(
+      {
+        display_order: nextDisplayOrder,
+      },
+      {
+        ...(options.transaction ? { transaction: options.transaction } : {}),
+      },
+    )
+  }
+}
+
+async function resequenceElementSubElements(elementId, options = {}) {
+  const normalizedElementId = normalizeProductIdentifier(elementId)
+  const subElements = await SubElementProductDesign.findAll({
+    where: {
+      element_product_design_id: normalizedElementId,
+    },
+    order: [
+      ['display_order', 'ASC'],
+      ['created_at', 'ASC'],
+      ['id', 'ASC'],
+    ],
+    ...(options.transaction ? { transaction: options.transaction } : {}),
+  })
+
+  for (const [index, subElement] of subElements.entries()) {
+    const nextDisplayOrder = index + 1
+    const nextIndex = String(nextDisplayOrder).padStart(2, '0')
+
+    if (
+      getOptionalInteger(subElement.display_order) === nextDisplayOrder &&
+      getTrimmedText(subElement.index) === nextIndex
+    ) {
+      continue
+    }
+
+    await subElement.update(
+      {
+        display_order: nextDisplayOrder,
+        index: nextIndex,
+      },
+      {
+        ...(options.transaction ? { transaction: options.transaction } : {}),
+      },
+    )
+  }
+}
+
+async function deleteProductElement(productId, elementId) {
+  const { element, productId: resolvedProductId } = await findElementForUpdate(productId, elementId)
+  const transaction = await ProductDevelopmentProduct.sequelize.transaction()
+
+  try {
+    await element.destroy({ transaction })
+    await resequenceProductElements(resolvedProductId, { transaction })
+
+    await transaction.commit()
+    return getSerializedProductById(resolvedProductId)
+  } catch (error) {
+    await transaction.rollback()
+    throw error
+  }
+}
+
+async function deleteElement(elementId) {
+  const { element, productId } = await findElementForUpdate(null, elementId)
+  return deleteProductElement(productId, element.id)
+}
+
+async function deleteProductSubElement(productId, elementId, subElementId) {
+  const {
+    subElement,
+    productId: resolvedProductId,
+    elementId: resolvedElementId,
+  } = await findSubElementForUpdate(productId, elementId, subElementId)
+  const transaction = await ProductDevelopmentProduct.sequelize.transaction()
+
+  try {
+    await subElement.destroy({ transaction })
+    await resequenceElementSubElements(resolvedElementId, { transaction })
+
+    await transaction.commit()
+    return getSerializedProductById(resolvedProductId)
+  } catch (error) {
+    await transaction.rollback()
+    throw error
+  }
+}
+
+async function deleteSubElement(subElementId) {
+  const {
+    subElement,
+    productId,
+    elementId,
+  } = await findSubElementForUpdate(null, null, subElementId)
+
+  return deleteProductSubElement(productId, elementId, subElement.id)
+}
+
 async function deleteProduct(productId) {
   const normalizedProductId = normalizeProductIdentifier(productId)
   const serializedProduct = await getSerializedProductById(normalizedProductId)
@@ -2146,6 +2266,10 @@ module.exports = {
   updateElement,
   updateProductSubElement,
   updateSubElement,
+  deleteProductElement,
+  deleteElement,
+  deleteProductSubElement,
+  deleteSubElement,
   deleteProduct,
   archiveProduct,
   restoreProduct,
