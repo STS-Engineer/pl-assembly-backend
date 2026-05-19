@@ -6,6 +6,7 @@ const {
   createProductElement,
   createProductSubElement,
   createSubElementConversationMessage,
+  approveElementValidationByToken,
   deleteElement,
   deleteProduct,
   deleteProductElement,
@@ -13,6 +14,7 @@ const {
   deleteSubElement,
   getElementConversation,
   getAllProducts,
+  getProductById,
   getSubElementConversation,
   restoreProduct,
   toggleElementConversationChecklistItem,
@@ -27,6 +29,8 @@ const {
 } = require('../controllers/product-development.controller')
 
 router.get('/products', getAllProducts)
+router.get('/products/:id', getProductById)
+router.get('/elements/validation/approve/:token', approveElementValidationByToken)
 router.post('/products', createProduct)
 router.delete('/elements/:elementId', deleteElement)
 router.patch('/elements/:elementId', updateElement)

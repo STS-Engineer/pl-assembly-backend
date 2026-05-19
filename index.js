@@ -312,6 +312,88 @@ async function ensureProductDevelopmentArchiveColumns() {
   }
 }
 
+async function ensureProductDevelopmentProductColumns() {
+  const queryInterface = sequelize.getQueryInterface()
+  const tableName = ProductDevelopmentProduct.getTableName()
+  const existingTables = await queryInterface.showAllTables()
+  const normalizedTableNames = new Set(
+    existingTables
+      .map((tableEntry) => normalizeTableName(tableEntry))
+      .filter(Boolean),
+  )
+
+  if (!normalizedTableNames.has(tableName)) {
+    return
+  }
+
+  let tableDescription = await queryInterface.describeTable(tableName)
+
+  if (tableDescription?.deadline && !tableDescription?.creation_date) {
+    await queryInterface.renameColumn(tableName, 'deadline', 'creation_date')
+    tableDescription = await queryInterface.describeTable(tableName)
+  }
+
+  if (!tableDescription?.creation_date) {
+    await queryInterface.addColumn(tableName, 'creation_date', {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    })
+  }
+
+  if (!tableDescription?.project_status) {
+    await queryInterface.addColumn(tableName, 'project_status', {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: 'in progress',
+    })
+  }
+
+  await sequelize.query(
+    `UPDATE ${quoteIdentifier(tableName)}
+     SET ${quoteIdentifier('creation_date')} = COALESCE(${quoteIdentifier('creation_date')}, CAST(${quoteIdentifier('created_at')} AS DATE), CURRENT_DATE)
+     WHERE ${quoteIdentifier('creation_date')} IS NULL`,
+  )
+
+  await sequelize.query(
+    `UPDATE ${quoteIdentifier(tableName)}
+     SET ${quoteIdentifier('project_status')} = 'in progress'
+     WHERE ${quoteIdentifier('project_status')} IS NULL
+        OR BTRIM(${quoteIdentifier('project_status')}) = ''`,
+  )
+
+  await sequelize.query(
+    `UPDATE ${quoteIdentifier(tableName)}
+     SET ${quoteIdentifier('project_status')} = LOWER(BTRIM(${quoteIdentifier('project_status')}))`,
+  )
+
+  await sequelize.query(
+    `UPDATE ${quoteIdentifier(tableName)}
+     SET ${quoteIdentifier('project_status')} = 'in progress'
+     WHERE ${quoteIdentifier('project_status')} NOT IN ('in progress', 'stand by', 'done', 'blocked')`,
+  )
+
+  await sequelize.query(
+    `ALTER TABLE ${quoteIdentifier(tableName)}
+     ALTER COLUMN ${quoteIdentifier('creation_date')} SET NOT NULL`,
+  )
+
+  await sequelize.query(
+    `ALTER TABLE ${quoteIdentifier(tableName)}
+     ALTER COLUMN ${quoteIdentifier('project_status')} SET NOT NULL`,
+  )
+
+  await sequelize.query(
+    `ALTER TABLE ${quoteIdentifier(tableName)}
+     ALTER COLUMN ${quoteIdentifier('project_status')} SET DEFAULT 'in progress'`,
+  )
+
+  tableDescription = await queryInterface.describeTable(tableName)
+
+  if (tableDescription?.deadline) {
+    await queryInterface.removeColumn(tableName, 'deadline')
+  }
+}
+
 async function ensureProductDevelopmentConversationNullableColumns() {
   const queryInterface = sequelize.getQueryInterface()
   const tableName = SubElementConversationMessage.getTableName()
@@ -334,6 +416,72 @@ async function ensureProductDevelopmentConversationNullableColumns() {
         'rfq_costing_id',
       )} DROP NOT NULL`,
     )
+  }
+}
+
+async function ensureProductDevelopmentElementValidationWorkflowColumns() {
+  const queryInterface = sequelize.getQueryInterface()
+  const tableName = ElementProductDesign.getTableName()
+  const existingTables = await queryInterface.showAllTables()
+  const normalizedTableNames = new Set(
+    existingTables
+      .map((tableEntry) => normalizeTableName(tableEntry))
+      .filter(Boolean),
+  )
+
+  if (!normalizedTableNames.has(tableName)) {
+    return
+  }
+
+  const enumTypeName = 'enum_element-product-design_validation'
+
+  await sequelize.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM pg_type
+        WHERE typname = '${enumTypeName}'
+      ) THEN
+        ALTER TYPE ${quoteIdentifier(enumTypeName)} ADD VALUE IF NOT EXISTS 'Need to be Validated';
+      END IF;
+    END
+    $$;
+  `)
+
+  const tableDescription = await queryInterface.describeTable(tableName)
+
+  if (!tableDescription?.validation_approval_token) {
+    await queryInterface.addColumn(tableName, 'validation_approval_token', {
+      type: DataTypes.STRING,
+      allowNull: true,
+    })
+  }
+
+  if (!tableDescription?.validation_approval_token_expires_at) {
+    await queryInterface.addColumn(tableName, 'validation_approval_token_expires_at', {
+      type: DataTypes.DATE,
+      allowNull: true,
+    })
+  }
+
+  if (!tableDescription?.validation_approval_token_used_at) {
+    await queryInterface.addColumn(tableName, 'validation_approval_token_used_at', {
+      type: DataTypes.DATE,
+      allowNull: true,
+    })
+  }
+
+  const existingIndexes = await queryInterface.showIndex(tableName)
+  const hasValidationTokenIndex = existingIndexes.some(
+    (indexEntry) => indexEntry?.name === 'idx_epd_validation_approval_token',
+  )
+
+  if (!hasValidationTokenIndex) {
+    await queryInterface.addIndex(tableName, ['validation_approval_token'], {
+      name: 'idx_epd_validation_approval_token',
+      unique: true,
+    })
   }
 }
 
@@ -402,6 +550,8 @@ async function startServer() {
   await ensureConversationMessageIndexNames()
   await ensureRfqCostingDueDateColumn()
   await ensureRfqCostingSubElementDeadlineAlertColumns()
+  await ensureProductDevelopmentProductColumns()
+  await ensureProductDevelopmentElementValidationWorkflowColumns()
   await ensureProductDevelopmentArchiveColumns()
   await ensureProductDevelopmentConversationNullableColumns()
   await sequelize.sync({ alter: true })

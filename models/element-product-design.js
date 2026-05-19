@@ -21,6 +21,7 @@ const STATUS_VALUES = [
 const VALIDATION_STATUS_VALUES = [
   'Not requested',
   'In progress',
+  'Need to be Validated',
   'Validated',
   'Need to be Reworked',
   'Blocked',
@@ -100,6 +101,19 @@ const ElementProductDesign = sequelize.define(
       type: DataTypes.ENUM(...VALIDATION_STATUS_VALUES),
       allowNull: false,
       defaultValue: 'Not requested',
+    },
+    validation_approval_token: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      unique: true,
+    },
+    validation_approval_token_expires_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+    validation_approval_token_used_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
     },
     development_time: {
       type: DataTypes.ENUM(...DEVELOPMENT_TIME_VALUES),

@@ -344,6 +344,14 @@ function getPasswordResetUrl(resetToken) {
   return `${normalizeBaseUrl(process.env.BACKEND_URL)}/api/users/reset-password/${encodedToken}`
 }
 
+function getWorkspaceProductDevelopmentUrl() {
+  return `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/workspace/product-development`
+}
+
+function getProductDevelopmentValidationApprovalUrl(approvalToken) {
+  return `${normalizeBaseUrl(process.env.BACKEND_URL)}/api/product-development/elements/validation/approve/${encodeURIComponent(approvalToken)}`
+}
+
 async function sendAdminApprovalRequest(user, approvalToken) {
   const recipients = resolveAdminRecipients(user.adminEmails)
   const notificationRecipients =
@@ -1216,10 +1224,170 @@ async function sendSubElementStatusNotification(
   })
 }
 
+async function sendProductDevelopmentValidationRequestToLeader({
+  to,
+  leaderName,
+  taskName,
+  productRef = '',
+  productName = '',
+  designerName = '',
+  approvalToken = '',
+  workspaceUrl = '',
+}) {
+  if (!to || !String(to).trim()) {
+    throw new Error('Leader email is required to send the validation request.')
+  }
+
+  const safeLeaderName = getDisplayValue(leaderName, 'Leader')
+  const safeTaskName = getDisplayValue(taskName, 'Task')
+  const safeProductRef = getOptionalText(productRef)
+  const safeProductName = getOptionalText(productName)
+  const safeDesignerName = getOptionalText(designerName)
+  const normalizedApprovalToken = getOptionalText(approvalToken)
+  const approvalUrl = normalizedApprovalToken
+    ? getProductDevelopmentValidationApprovalUrl(normalizedApprovalToken)
+    : ''
+  const safeWorkspaceUrl = getOptionalText(workspaceUrl)
+  const intro = `You need to validate the designer step: ${safeTaskName}.`
+  const text = [
+    `Hello ${safeLeaderName},`,
+    '',
+    `You need to validate the designer step: ${safeTaskName}.`,
+    safeProductName ? `Product: ${safeProductName}` : '',
+    safeProductRef ? `Product ref: ${safeProductRef}` : '',
+    safeDesignerName ? `Designer: ${safeDesignerName}` : '',
+    '',
+    approvalUrl ? `Validate task: ${approvalUrl}` : '',
+    safeWorkspaceUrl ? `Open Product Design board: ${safeWorkspaceUrl}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+  const html = renderEmailShell({
+    eyebrow: 'Designer step validation',
+    title: 'Validation required for designer step',
+    intro,
+    contentHtml: `
+      <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+          ${renderDetailRow('Task', safeTaskName)}
+          ${safeProductName ? renderDetailRow('Product', safeProductName) : ''}
+          ${safeProductRef ? renderDetailRow('Product ref', safeProductRef) : ''}
+          ${safeDesignerName ? renderDetailRow('Designer', safeDesignerName) : ''}
+        </table>
+      </div>
+      <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
+        ${
+          approvalUrl
+            ? 'You need to validate this designer step. You can validate it directly from the button below or open the Product Design board to review it manually.'
+            : 'You need to validate this designer step from the Product Design board.'
+        }
+      </p>
+      ${
+        safeWorkspaceUrl
+          ? `
+      <p style="margin:14px 0 0;font-size:0.95rem;line-height:1.6;color:#53697b;">
+        Open the Product Design board:
+        <a href="${safeWorkspaceUrl}" style="color:#ef7807;text-decoration:none;font-weight:700;">${safeWorkspaceUrl}</a>
+      </p>
+      `
+          : ''
+      }
+    `,
+    actionLabel: approvalUrl ? 'Validate task' : safeWorkspaceUrl ? 'Open Product Design' : '',
+    actionUrl: approvalUrl || safeWorkspaceUrl,
+    footerNote: approvalUrl
+      ? `
+      If the button does not work, copy this link into your browser:<br />
+      <a href="${approvalUrl}" style="color:#ef7807;text-decoration:none;font-weight:700;">${approvalUrl}</a>
+    `
+      : safeWorkspaceUrl
+        ? `
+      Open the Product Design board here:<br />
+      <a href="${safeWorkspaceUrl}" style="color:#ef7807;text-decoration:none;font-weight:700;">${safeWorkspaceUrl}</a>
+    `
+        : '',
+  })
+
+  return sendMail({
+    to,
+    subject: 'PL Assembly - Validation required for designer step',
+    text,
+    html,
+    attachments: getBrandLogoAttachment(),
+  })
+}
+
+async function sendProductDevelopmentReworkToDesigner({
+  to,
+  designerName,
+  taskName,
+  productRef = '',
+  productName = '',
+  leaderName = '',
+}) {
+  if (!to || !String(to).trim()) {
+    throw new Error('Designer email is required to send the rework request.')
+  }
+
+  const safeDesignerName = getDisplayValue(designerName, 'Designer')
+  const safeTaskName = getDisplayValue(taskName, 'Task')
+  const safeProductRef = getOptionalText(productRef)
+  const safeProductName = getOptionalText(productName)
+  const safeLeaderName = getOptionalText(leaderName)
+  const workspaceUrl = getWorkspaceProductDevelopmentUrl()
+  const intro = `Your task "${safeTaskName}" needs to be reworked.`
+  const text = [
+    `Hello ${safeDesignerName},`,
+    '',
+    `Your task "${safeTaskName}" needs to be reworked.`,
+    safeProductName ? `Product: ${safeProductName}` : '',
+    safeProductRef ? `Product ref: ${safeProductRef}` : '',
+    safeLeaderName ? `Leader: ${safeLeaderName}` : '',
+    '',
+    `Open Product Design: ${workspaceUrl}`,
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+  const html = renderEmailShell({
+    eyebrow: 'Task rework',
+    title: 'Your task needs to be reworked',
+    intro,
+    contentHtml: `
+      <div style="border-radius:20px;background:#fbf8f4;border:1px solid rgba(14,78,120,0.14);padding:18px 18px 6px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+          ${renderDetailRow('Task', safeTaskName)}
+          ${safeProductName ? renderDetailRow('Product', safeProductName) : ''}
+          ${safeProductRef ? renderDetailRow('Product ref', safeProductRef) : ''}
+          ${safeLeaderName ? renderDetailRow('Leader', safeLeaderName) : ''}
+        </table>
+      </div>
+      <p style="margin:18px 0 0;font-size:0.96rem;line-height:1.6;color:#53697b;">
+        Please open the Product Design board, review the feedback, and update the task accordingly.
+      </p>
+    `,
+    actionLabel: 'Open Product Design',
+    actionUrl: workspaceUrl,
+  })
+
+  return sendMail({
+    to,
+    subject: `PL Assembly - Your task ${safeTaskName} needs to be reworked`,
+    text,
+    html,
+    attachments: getBrandLogoAttachment(),
+  })
+}
+
 module.exports = {
+  getWorkspaceProductDevelopmentUrl,
   getPasswordResetUrl,
+  getProductDevelopmentValidationApprovalUrl,
   resolveAdminRecipients,
   sendAdminApprovalRequest,
+  sendProductDevelopmentReworkToDesigner,
+  sendProductDevelopmentValidationRequestToLeader,
   sendUserPasswordResetEmail,
   sendUserApprovalConfirmation,
   sendSubElementApprovalRequest,

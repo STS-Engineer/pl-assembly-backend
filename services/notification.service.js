@@ -117,7 +117,7 @@ function serializeNotification(notification) {
   }
 }
 
-async function createNotificationsForRecipients(recipients, payload = {}) {
+async function createNotificationsForRecipients(recipients, payload = {}, options = {}) {
   const recipientReferences = normalizeRecipientReferences(recipients).filter(
     (recipientReference, index, references) =>
       references.findIndex(
@@ -180,6 +180,7 @@ async function createNotificationsForRecipients(recipients, payload = {}) {
       [Op.or]: userLookupConditions,
     },
     attributes: ['id', 'email'],
+    ...(options.transaction ? { transaction: options.transaction } : {}),
   })
 
   const userIdsLookup = users.reduce((lookup, user) => {
@@ -229,7 +230,9 @@ async function createNotificationsForRecipients(recipients, payload = {}) {
     }
   }
 
-  await Notification.bulkCreate(notificationsToCreate)
+  await Notification.bulkCreate(notificationsToCreate, {
+    ...(options.transaction ? { transaction: options.transaction } : {}),
+  })
 
   return {
     created_count: notificationsToCreate.length,

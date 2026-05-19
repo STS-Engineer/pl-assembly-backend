@@ -491,8 +491,10 @@ module.exports = {
   forgotPassword,
   getAllUsers,
   getUserById,
+  signToken,
   signUp,
   signIn,
+  verifySignedToken,
   verifyResetPasswordToken,
   resetPasswordWithToken,
 }

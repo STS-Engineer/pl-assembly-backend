@@ -3,9 +3,37 @@ const ElementProductDesign = require('../models/element-product-design')
 const SubElementProductDesign = require('../models/sub-element-product-design')
 const ProductDevelopmentProduct = require('../models/product-development-product.model')
 const SubElementConversationMessage = require('../models/sub-element-conversation-message.model')
+const User = require('../models/user.model')
+const notificationService = require('./notification.service')
+const emailService = require('../emails/email.service')
+const userService = require('./user.service')
 
 const PRODUCT_DEVELOPMENT_ELEMENT_CONVERSATION_SCOPE = 'product-development-element'
 const PRODUCT_DEVELOPMENT_SUB_ELEMENT_CONVERSATION_SCOPE = 'product-development-sub-element'
+const PRODUCT_STATUS_VALUES = ['in progress', 'stand by', 'done', 'blocked']
+const PRODUCT_ELEMENT_VALIDATION_APPROVAL_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7
+const PRODUCT_ELEMENT_VALIDATION_VALUES = [
+  'Not requested',
+  'In progress',
+  'Need to be Validated',
+  'Validated',
+  'Need to be Reworked',
+  'Blocked',
+]
+
+function normalizeEnumLookupKey(value) {
+  return getTrimmedText(value)
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+}
+
+function logProductDevelopmentValidation(level, message, details = {}) {
+  const logger =
+    level === 'error' ? console.error : level === 'warn' ? console.warn : console.info
+
+  logger(`[ProductDevelopmentValidation] ${message}`, details)
+}
 
 const DEFAULT_PRODUCT_ELEMENT_TITLES = [
   'Check Competitors',
@@ -73,6 +101,35 @@ function createHttpError(statusCode, message) {
 
 function getTrimmedText(value) {
   return String(value || '').trim()
+}
+
+function normalizeLookupKey(value) {
+  return getTrimmedText(value).toLowerCase()
+}
+
+function normalizeBaseUrl(value) {
+  return String(value || 'http://localhost:5173').replace(/\/+$/, '')
+}
+
+function getWorkspaceProductDevelopmentUrl() {
+  return `${normalizeBaseUrl(process.env.FRONTEND_URL || process.env.BACKEND_URL)}/workspace/product-development`
+}
+
+function buildProductDevelopmentValidationApprovalUrl(token) {
+  return `${normalizeBaseUrl(process.env.BACKEND_URL)}/api/product-development/elements/validation/approve/${encodeURIComponent(token)}`
+}
+
+function getDisplayNameFromUser(user, fallback = 'User') {
+  const fullName = getTrimmedText(user?.full_name ?? user?.fullName)
+  const email = getTrimmedText(user?.email)
+  return fullName || email || fallback
+}
+
+function buildNotificationSummary(parts = []) {
+  return parts
+    .map((part) => getTrimmedText(part))
+    .filter(Boolean)
+    .join(' | ')
 }
 
 function normalizeOptionalEmail(value) {
@@ -144,11 +201,11 @@ function addDays(dateOnlyValue, numberOfDays) {
   return formatDateOnly(nextDate)
 }
 
-function normalizeDeadline(value) {
+function normalizeCreationDate(value) {
   const normalizedValue = getTrimmedText(value)
 
   if (!normalizedValue) {
-    throw createHttpError(400, 'Deadline is required.')
+    throw createHttpError(400, 'Creation date is required.')
   }
 
   const isoMatch = normalizedValue.match(/^(\d{4})-(\d{2})-(\d{2})$/)
@@ -162,7 +219,7 @@ function normalizeDeadline(value) {
       parsedDate.getMonth() !== Number(month) - 1 ||
       parsedDate.getDate() !== Number(day)
     ) {
-      throw createHttpError(400, 'Invalid deadline.')
+      throw createHttpError(400, 'Invalid creation date.')
     }
 
     return normalizedValue
@@ -171,7 +228,7 @@ function normalizeDeadline(value) {
   const parsedDate = new Date(normalizedValue)
 
   if (Number.isNaN(parsedDate.getTime())) {
-    throw createHttpError(400, 'Invalid deadline.')
+    throw createHttpError(400, 'Invalid creation date.')
   }
 
   return parsedDate.toISOString().slice(0, 10)
@@ -182,7 +239,21 @@ function normalizeOptionalDate(value) {
     return null
   }
 
-  return normalizeDeadline(value)
+  return normalizeCreationDate(value)
+}
+
+function normalizeProjectStatus(value, fallback = 'in progress') {
+  const normalizedValue = getTrimmedText(value).toLowerCase()
+  const resolvedValue = normalizedValue || fallback
+
+  if (!PRODUCT_STATUS_VALUES.includes(resolvedValue)) {
+    throw createHttpError(
+      400,
+      `Project status must be one of: ${PRODUCT_STATUS_VALUES.join(', ')}.`,
+    )
+  }
+
+  return resolvedValue
 }
 
 function normalizeOptionalInteger(value, options = {}) {
@@ -304,6 +375,139 @@ function normalizeEnumValue(value, allowedValues = [], options = {}) {
   }
 
   return normalizedValue
+}
+
+function getNormalizedElementValidationValue(value) {
+  const fieldLabel = 'Validation'
+  const normalizedValue = getTrimmedText(value)
+
+  if (!normalizedValue) {
+    throw createHttpError(400, `${fieldLabel} is required.`)
+  }
+
+  const lookupKey = normalizeEnumLookupKey(normalizedValue)
+  const matchedValue = PRODUCT_ELEMENT_VALIDATION_VALUES.find(
+    (candidateValue) => normalizeEnumLookupKey(candidateValue) === lookupKey,
+  )
+
+  if (!matchedValue) {
+    throw createHttpError(400, `${fieldLabel} is invalid.`)
+  }
+
+  return matchedValue
+}
+
+function getComparableValidationValue(value) {
+  return normalizeEnumLookupKey(value)
+}
+
+function getProductDisplayLabel(product = {}) {
+  const productRef = getTrimmedText(product?.product_ref ?? product?.productRef)
+  const productName = getTrimmedText(product?.product_name ?? product?.productName)
+
+  if (productRef && productName) {
+    return `${productRef} - ${productName}`
+  }
+
+  return productName || productRef || 'Product'
+}
+
+function matchesUserAssignment(assignmentValue, authenticatedUser) {
+  const normalizedAssignment = normalizeLookupKey(assignmentValue)
+
+  if (!normalizedAssignment || !authenticatedUser) {
+    return false
+  }
+
+  const normalizedUserEmail = normalizeLookupKey(authenticatedUser.email)
+  const normalizedUserFullName = normalizeLookupKey(
+    authenticatedUser.full_name ?? authenticatedUser.fullName,
+  )
+
+  return normalizedAssignment === normalizedUserEmail || normalizedAssignment === normalizedUserFullName
+}
+
+async function resolveApprovedUserByAssignmentValue(value) {
+  const normalizedValue = normalizeLookupKey(value)
+
+  if (!normalizedValue) {
+    return null
+  }
+
+  const directEmailMatch = await User.findOne({
+    where: {
+      email: normalizedValue,
+      approval_status: 'approved',
+    },
+    attributes: ['id', 'email', 'full_name', 'role', 'approval_status'],
+  })
+
+  if (directEmailMatch) {
+    return directEmailMatch
+  }
+
+  return User.findOne({
+    where: {
+      approval_status: 'approved',
+      full_name: {
+        [Op.iLike]: normalizedValue,
+      },
+    },
+    attributes: ['id', 'email', 'full_name', 'role', 'approval_status'],
+  })
+}
+
+function getValidationApprovalTokenExpiryDate() {
+  return new Date(Date.now() + PRODUCT_ELEMENT_VALIDATION_APPROVAL_TOKEN_TTL_SECONDS * 1000)
+}
+
+function createElementValidationApprovalToken(element, leaderUser) {
+  return userService.signToken(
+    {
+      type: 'product-development-validation-approve',
+      action: 'validate',
+      elementId: Number(element.id),
+      leaderId: Number(leaderUser.id),
+      leaderEmail: normalizeLookupKey(leaderUser.email),
+    },
+    PRODUCT_ELEMENT_VALIDATION_APPROVAL_TOKEN_TTL_SECONDS,
+  )
+}
+
+function isAdminUser(authenticatedUser) {
+  return normalizeLookupKey(authenticatedUser?.role) === 'admin'
+}
+
+function ensureValidationUpdatePermission(element, nextValidation, authenticatedUser) {
+  if (!authenticatedUser) {
+    throw createHttpError(401, 'Authentication is required.')
+  }
+
+  if (isAdminUser(authenticatedUser)) {
+    return
+  }
+
+  const isLeader = matchesUserAssignment(element?.leader, authenticatedUser)
+  const isDesigner = matchesUserAssignment(element?.designer, authenticatedUser)
+
+  if (!isLeader && !isDesigner) {
+    throw createHttpError(403, 'You are not allowed to update this validation field.')
+  }
+
+  if (
+    nextValidation === 'Validated' ||
+    nextValidation === 'Need to be Reworked'
+  ) {
+    if (!isLeader) {
+      throw createHttpError(403, 'Only the assigned leader can validate or request rework.')
+    }
+
+    return
+  }
+
+  if (nextValidation === 'Need to be Validated' && !isLeader && !isDesigner) {
+    throw createHttpError(403, 'Only the assigned designer or leader can request validation.')
+  }
 }
 
 function normalizeOptionalSubElementSchedule(value) {
@@ -1002,8 +1206,12 @@ function sortSerializedElements(elements = []) {
 function serializeProduct(product) {
   const rawProduct =
     product && typeof product.toJSON === 'function' ? product.toJSON() : product || {}
-  const normalizedDeadline = getTrimmedText(rawProduct.deadline) || null
-  const deadlineStatus = getDeadlineStatus(normalizedDeadline)
+  const normalizedCreationDate = getTrimmedText(
+    rawProduct.creation_date ?? rawProduct.creationDate,
+  ) || null
+  const normalizedProjectStatus = normalizeProjectStatus(
+    rawProduct.project_status ?? rawProduct.projectStatus,
+  )
   const normalizedRef = getTrimmedText(rawProduct.product_ref)
   const normalizedName = getTrimmedText(rawProduct.product_name)
   const normalizedCreatedByEmail = normalizeOptionalEmail(rawProduct.created_by_email)
@@ -1014,9 +1222,10 @@ function serializeProduct(product) {
     productRef: normalizedRef,
     product_name: normalizedName,
     productName: normalizedName,
-    deadline: normalizedDeadline,
-    deadline_status: deadlineStatus,
-    deadlineStatus,
+    creation_date: normalizedCreationDate,
+    creationDate: normalizedCreationDate,
+    project_status: normalizedProjectStatus,
+    projectStatus: normalizedProjectStatus,
     created_by_email: normalizedCreatedByEmail,
     createdByEmail: normalizedCreatedByEmail,
     is_archived: Boolean(rawProduct.is_archived),
@@ -1050,33 +1259,49 @@ function serializeProductWithElements(product, elements = []) {
 
 function sortSerializedProducts(products = []) {
   return [...products].sort((leftProduct, rightProduct) => {
-    const leftDeadline = getTrimmedText(leftProduct?.deadline)
-    const rightDeadline = getTrimmedText(rightProduct?.deadline)
+    const leftCreationDate = getTrimmedText(
+      leftProduct?.creationDate ??
+        leftProduct?.creation_date ??
+        leftProduct?.createdAt ??
+        leftProduct?.created_at,
+    )
+    const rightCreationDate = getTrimmedText(
+      rightProduct?.creationDate ??
+        rightProduct?.creation_date ??
+        rightProduct?.createdAt ??
+        rightProduct?.created_at,
+    )
 
-    if (leftDeadline && rightDeadline && leftDeadline !== rightDeadline) {
-      return leftDeadline.localeCompare(rightDeadline)
+    if (leftCreationDate && rightCreationDate && leftCreationDate !== rightCreationDate) {
+      return rightCreationDate.localeCompare(leftCreationDate)
     }
 
-    if (leftDeadline && !rightDeadline) {
+    if (leftCreationDate && !rightCreationDate) {
       return -1
     }
 
-    if (!leftDeadline && rightDeadline) {
+    if (!leftCreationDate && rightCreationDate) {
       return 1
     }
 
-    const leftCreatedAt = new Date(leftProduct?.createdAt || 0).getTime()
-    const rightCreatedAt = new Date(rightProduct?.createdAt || 0).getTime()
-    return rightCreatedAt - leftCreatedAt
+    const leftCreatedAt = new Date(leftProduct?.createdAt ?? leftProduct?.created_at ?? 0).getTime()
+    const rightCreatedAt = new Date(
+      rightProduct?.createdAt ?? rightProduct?.created_at ?? 0,
+    ).getTime()
+
+    if (leftCreatedAt !== rightCreatedAt) {
+      return rightCreatedAt - leftCreatedAt
+    }
+
+    return Number(rightProduct?.id || 0) - Number(leftProduct?.id || 0)
   })
 }
 
 function buildWhereClause(options = {}) {
   const searchTerm = getTrimmedText(options.search)
-  const deadlineStatus = getTrimmedText(
-    options.deadline_status ?? options.deadlineStatus,
+  const projectStatus = getTrimmedText(
+    options.project_status ?? options.projectStatus,
   ).toLowerCase()
-  const referenceDate = getTodayDateOnly()
   const queryConditions = []
 
   if (searchTerm) {
@@ -1096,42 +1321,9 @@ function buildWhereClause(options = {}) {
     })
   }
 
-  if (deadlineStatus === 'due-today') {
+  if (projectStatus) {
     queryConditions.push({
-      deadline: referenceDate,
-    })
-  }
-
-  if (deadlineStatus === 'upcoming') {
-    queryConditions.push({
-      deadline: {
-        [Op.gt]: referenceDate,
-        [Op.lte]: addDays(referenceDate, 7),
-      },
-    })
-  }
-
-  if (deadlineStatus === 'scheduled') {
-    queryConditions.push({
-      deadline: {
-        [Op.gt]: addDays(referenceDate, 7),
-      },
-    })
-  }
-
-  if (deadlineStatus === 'overdue') {
-    queryConditions.push({
-      deadline: {
-        [Op.lt]: referenceDate,
-      },
-    })
-  }
-
-  if (deadlineStatus === 'no-deadline') {
-    queryConditions.push({
-      deadline: {
-        [Op.is]: null,
-      },
+      project_status: normalizeProjectStatus(projectStatus),
     })
   }
 
@@ -1408,6 +1600,324 @@ async function getSerializedProductById(productId, options = {}) {
   return serializeProductWithElements(product, elementsByProductId.get(normalizedProductId) || [])
 }
 
+async function getProductById(productId) {
+  return getSerializedProductById(productId)
+}
+
+async function sendElementStatusValidationEmailToLeader({
+  element,
+  taskName,
+  product,
+}) {
+  const productRef = getTrimmedText(product?.product_ref)
+  const productName = getTrimmedText(product?.product_name)
+  const workspaceUrl = getWorkspaceProductDevelopmentUrl()
+  const leaderUser = await resolveApprovedUserByAssignmentValue(element.leader)
+
+  logProductDevelopmentValidation(
+    leaderUser?.email ? 'info' : 'warn',
+    leaderUser?.email
+      ? 'leader resolved for status validation request'
+      : 'Leader not found for element-product-design validation email',
+    {
+      elementId: Number(element?.id),
+      taskName,
+      leaderFound: Boolean(leaderUser),
+      leaderAssignment: getTrimmedText(element?.leader) || null,
+      leaderId: leaderUser?.id ?? null,
+      leaderEmail: leaderUser?.email ?? null,
+    },
+  )
+
+  if (!leaderUser?.email) {
+    logProductDevelopmentValidation(
+      'warn',
+      `Leader email missing for element-product-design ${Number(element?.id)}`,
+      {
+        elementId: Number(element?.id),
+        taskName,
+        leaderAssignment: getTrimmedText(element?.leader) || null,
+        leaderId: leaderUser?.id ?? null,
+        leaderEmail: leaderUser?.email ?? null,
+      },
+    )
+    throw createHttpError(400, 'A valid leader email is required before requesting validation.')
+  }
+
+  const leaderName = getDisplayNameFromUser(leaderUser, 'Leader')
+  const designerName = getTrimmedText(element.designer)
+
+  let emailResult = null
+
+  try {
+    emailResult = await emailService.sendProductDevelopmentValidationRequestToLeader({
+      to: leaderUser.email,
+      leaderName,
+      taskName,
+      productRef,
+      productName,
+      designerName,
+      workspaceUrl,
+    })
+  } catch (error) {
+    logProductDevelopmentValidation('error', 'leader status validation email failed', {
+      elementId: Number(element?.id),
+      taskName,
+      leaderId: leaderUser.id,
+      leaderEmail: leaderUser.email,
+      emailError: error?.message || 'Unknown email error',
+    })
+
+    throw createHttpError(
+      503,
+      `Unable to send the validation email to the leader for element-product-design ${Number(element?.id)}.`,
+    )
+  }
+
+  logProductDevelopmentValidation('info', 'leader status validation email sent', {
+    elementId: Number(element?.id),
+    taskName,
+    leaderId: leaderUser.id,
+    leaderEmail: leaderUser.email,
+    emailSentResult: emailResult ?? true,
+  })
+}
+
+async function triggerElementStatusValidationWorkflow({
+  element,
+  previousStatus,
+  nextStatus,
+  transaction,
+}) {
+  const previousComparableStatus = normalizeEnumLookupKey(previousStatus)
+  const nextComparableStatus = normalizeEnumLookupKey(nextStatus)
+  const shouldSendLeaderEmail =
+    previousComparableStatus !== nextComparableStatus &&
+    nextStatus === 'Need to be Validated'
+
+  logProductDevelopmentValidation('info', 'element-product-design status workflow evaluation', {
+    elementId: Number(element?.id),
+    productId: Number(element?.product_development_product_id),
+    oldStatus: previousStatus || null,
+    newStatus: nextStatus || null,
+    shouldSendLeaderEmail,
+  })
+
+  if (!shouldSendLeaderEmail) {
+    return
+  }
+
+  const product = await ProductDevelopmentProduct.findByPk(element.product_development_product_id, {
+    ...(transaction ? { transaction } : {}),
+  })
+  const taskName = getTrimmedText(element.title) || 'Task'
+
+  await sendElementStatusValidationEmailToLeader({
+    element,
+    taskName,
+    product,
+  })
+}
+
+async function triggerElementValidationWorkflow({
+  element,
+  previousValidation,
+  nextValidation,
+  transaction,
+}) {
+  const previousComparableValidation = getComparableValidationValue(previousValidation)
+  const nextComparableValidation = getComparableValidationValue(nextValidation)
+  const shouldNotifyLeader =
+    previousComparableValidation !== nextComparableValidation &&
+    nextComparableValidation === normalizeEnumLookupKey('Need to be Validated')
+  const shouldSendValidationEmail = shouldNotifyLeader
+
+  logProductDevelopmentValidation('info', 'workflow evaluation', {
+    elementId: Number(element?.id),
+    productId: Number(element?.product_development_product_id),
+    oldStatus: previousValidation || null,
+    newStatus: nextValidation || null,
+    oldValidationStatus: previousValidation || null,
+    newValidationStatus: nextValidation || null,
+    shouldNotifyLeader,
+    shouldSendValidationEmail,
+  })
+
+  if (previousComparableValidation === nextComparableValidation) {
+    return
+  }
+
+  const product = await ProductDevelopmentProduct.findByPk(element.product_development_product_id, {
+    ...(transaction ? { transaction } : {}),
+  })
+  const taskName = getTrimmedText(element.title) || 'Task'
+  const productRef = getTrimmedText(product?.product_ref)
+  const productName = getTrimmedText(product?.product_name)
+  const workspaceUrl = getWorkspaceProductDevelopmentUrl()
+
+  if (nextComparableValidation === normalizeEnumLookupKey('Need to be Validated')) {
+    const leaderUser = await resolveApprovedUserByAssignmentValue(element.leader)
+
+    logProductDevelopmentValidation(
+      leaderUser?.email ? 'info' : 'warn',
+      leaderUser?.email
+        ? 'leader resolved for validation request'
+        : 'Leader not found for validation email',
+      {
+        elementId: Number(element?.id),
+        taskName,
+        leaderFound: Boolean(leaderUser),
+        leaderAssignment: getTrimmedText(element?.leader) || null,
+        leaderId: leaderUser?.id ?? null,
+        leaderEmail: leaderUser?.email ?? null,
+      },
+    )
+
+    if (!leaderUser?.email) {
+      logProductDevelopmentValidation('warn', `Leader email missing for task ${Number(element?.id)}`, {
+        elementId: Number(element?.id),
+        taskName,
+        leaderAssignment: getTrimmedText(element?.leader) || null,
+        leaderId: leaderUser?.id ?? null,
+        leaderEmail: leaderUser?.email ?? null,
+      })
+      throw createHttpError(400, 'A valid leader email is required before requesting validation.')
+    }
+
+    const approvalToken = createElementValidationApprovalToken(element, leaderUser)
+    const approvalTokenExpiresAt = getValidationApprovalTokenExpiryDate()
+    const leaderName = getDisplayNameFromUser(leaderUser, 'Leader')
+    const designerName = getTrimmedText(element.designer)
+
+    await element.update(
+      {
+        validation_approval_token: approvalToken,
+        validation_approval_token_expires_at: approvalTokenExpiresAt,
+        validation_approval_token_used_at: null,
+      },
+      { transaction },
+    )
+
+    const emailResult = await emailService.sendProductDevelopmentValidationRequestToLeader({
+      to: leaderUser.email,
+      leaderName,
+      taskName,
+      productRef,
+      productName,
+      designerName,
+      approvalToken,
+      workspaceUrl,
+    })
+
+    logProductDevelopmentValidation('info', 'leader validation request email sent', {
+      elementId: Number(element?.id),
+      taskName,
+      leaderId: leaderUser.id,
+      leaderEmail: leaderUser.email,
+      emailSentResult: emailResult ?? true,
+    })
+
+    const notificationResult = await notificationService.createNotificationsForRecipients(
+      [
+        {
+          user_id: leaderUser.id,
+          email: leaderUser.email,
+        },
+      ],
+      {
+        type: 'product-development-validation-request',
+        subject: 'PL Assembly - A task needs your validation',
+        title: 'A task needs your validation',
+        message: `Task ${taskName} needs your validation.`,
+        action_label: 'Validate task',
+        action_url: buildProductDevelopmentValidationApprovalUrl(approvalToken),
+        metadata: {
+          action_type: 'open-product-development',
+          section_id: 'product-development',
+          product_id: element.product_development_product_id,
+          element_id: element.id,
+          product_ref: productRef,
+          product_name: productName,
+          product_label: getProductDisplayLabel(product),
+          element_title: taskName,
+          leader_email: leaderUser.email,
+          designer: designerName,
+        },
+      },
+      { transaction },
+    )
+
+    logProductDevelopmentValidation('info', 'leader validation request notification created', {
+      elementId: Number(element?.id),
+      taskName,
+      leaderId: leaderUser.id,
+      leaderEmail: leaderUser.email,
+      notificationCreatedResult: notificationResult,
+    })
+
+    return
+  }
+
+  await element.update(
+    {
+      validation_approval_token: null,
+      validation_approval_token_expires_at: null,
+      validation_approval_token_used_at: null,
+    },
+    { transaction },
+  )
+
+  if (nextComparableValidation === normalizeEnumLookupKey('Need to be Reworked')) {
+    const designerUser = await resolveApprovedUserByAssignmentValue(element.designer)
+
+    if (!designerUser?.email) {
+      throw createHttpError(400, 'A valid designer email is required before requesting rework.')
+    }
+
+    const designerName = getDisplayNameFromUser(designerUser, 'Designer')
+    const leaderName = getTrimmedText(element.leader)
+
+    await emailService.sendProductDevelopmentReworkToDesigner({
+      to: designerUser.email,
+      designerName,
+      taskName,
+      productRef,
+      productName,
+      leaderName,
+    })
+
+    await notificationService.createNotificationsForRecipients(
+      [
+        {
+          user_id: designerUser.id,
+          email: designerUser.email,
+        },
+      ],
+      {
+        type: 'product-development-rework-request',
+        subject: `PL Assembly - Your task ${taskName} needs to be reworked`,
+        title: 'Your task needs to be reworked',
+        message: `Your task ${taskName} needs to be reworked.`,
+        action_label: 'Open Product Design',
+        action_url: workspaceUrl,
+        metadata: {
+          action_type: 'open-product-development',
+          section_id: 'product-development',
+          product_id: element.product_development_product_id,
+          element_id: element.id,
+          product_ref: productRef,
+          product_name: productName,
+          product_label: getProductDisplayLabel(product),
+          element_title: taskName,
+          designer_email: designerUser.email,
+          leader: leaderName,
+        },
+      },
+      { transaction },
+    )
+  }
+}
+
 function buildDefaultElementsPayload(productId) {
   return DEFAULT_PRODUCT_ELEMENT_TITLES.map((title, index) => ({
     product_development_product_id: productId,
@@ -1466,6 +1976,11 @@ async function ensureDefaultElementsForProductIds(productIds = [], options = {})
 async function getAllProducts(options = {}) {
   const products = await ProductDevelopmentProduct.findAll({
     where: buildCombinedWhereClause(options),
+    order: [
+      ['creation_date', 'DESC'],
+      ['created_at', 'DESC'],
+      ['id', 'DESC'],
+    ],
   })
   await ensureDefaultElementsForProductIds(products.map((product) => product.id))
   const elementsByProductId = await getElementsByProductIds(products.map((product) => product.id))
@@ -1480,7 +1995,12 @@ async function getAllProducts(options = {}) {
 async function createProduct(payload) {
   const normalizedProductRef = getTrimmedText(payload?.product_ref ?? payload?.productRef)
   const normalizedProductName = getTrimmedText(payload?.product_name ?? payload?.productName)
-  const normalizedDeadline = normalizeDeadline(payload?.deadline ?? payload?.due_date ?? payload?.dueDate)
+  const normalizedCreationDate = normalizeCreationDate(
+    payload?.creation_date ?? payload?.creationDate ?? payload?.deadline ?? payload?.due_date ?? payload?.dueDate,
+  )
+  const normalizedProjectStatus = normalizeProjectStatus(
+    payload?.project_status ?? payload?.projectStatus,
+  )
   const normalizedCreatedByEmail = normalizeOptionalEmail(
     payload?.created_by_email ?? payload?.createdByEmail,
   )
@@ -1512,7 +2032,8 @@ async function createProduct(payload) {
       {
         product_ref: normalizedProductRef,
         product_name: normalizedProductName,
-        deadline: normalizedDeadline,
+        creation_date: normalizedCreationDate,
+        project_status: normalizedProjectStatus,
         created_by_email: normalizedCreatedByEmail,
         is_archived: false,
         archived_at: null,
@@ -1548,12 +2069,25 @@ async function updateProduct(productId, payload) {
   const nextProductName =
     getTrimmedText(payload?.product_name ?? payload?.productName) ||
     getTrimmedText(product.product_name)
-  const nextDeadline =
+  const nextCreationDate =
+    Object.prototype.hasOwnProperty.call(payload || {}, 'creation_date') ||
+    Object.prototype.hasOwnProperty.call(payload || {}, 'creationDate') ||
     Object.prototype.hasOwnProperty.call(payload || {}, 'deadline') ||
     Object.prototype.hasOwnProperty.call(payload || {}, 'due_date') ||
     Object.prototype.hasOwnProperty.call(payload || {}, 'dueDate')
-      ? normalizeDeadline(payload?.deadline ?? payload?.due_date ?? payload?.dueDate)
-      : getTrimmedText(product.deadline)
+      ? normalizeCreationDate(
+          payload?.creation_date ??
+            payload?.creationDate ??
+            payload?.deadline ??
+            payload?.due_date ??
+            payload?.dueDate,
+        )
+      : getTrimmedText(product.creation_date)
+  const nextProjectStatus =
+    Object.prototype.hasOwnProperty.call(payload || {}, 'project_status') ||
+    Object.prototype.hasOwnProperty.call(payload || {}, 'projectStatus')
+      ? normalizeProjectStatus(payload?.project_status ?? payload?.projectStatus)
+      : normalizeProjectStatus(product.project_status)
   const nextCreatedByEmail =
     Object.prototype.hasOwnProperty.call(payload || {}, 'created_by_email') ||
     Object.prototype.hasOwnProperty.call(payload || {}, 'createdByEmail')
@@ -1586,7 +2120,8 @@ async function updateProduct(productId, payload) {
   await product.update({
     product_ref: nextProductRef,
     product_name: nextProductName,
-    deadline: nextDeadline,
+    creation_date: nextCreationDate,
+    project_status: nextProjectStatus,
     created_by_email: nextCreatedByEmail,
   })
 
@@ -1615,14 +2150,25 @@ async function createProductElement(productId, payload) {
       return Math.max(highestOrder, elementOrder ?? 0)
     }, 0) + 1
 
+  // Determine validation value
+  const validation = hasOwnPayloadField(payload, 'validation')
+    ? getNormalizedElementValidationValue(payload?.validation)
+    : 'Not requested'
+
+  // Business rule: if validation is "Validated", automatically set status to "Done"
+  let status = 'Not requested'
+  if (validation === 'Validated') {
+    status = 'Done'
+  }
+
   const createdElement = await ElementProductDesign.create({
     product_development_product_id: normalizedProductId,
     title,
     display_order: nextDisplayOrder,
     is_default: false,
     due_date: dueDate,
-    status: 'Not requested',
-    validation: 'Not requested',
+    status,
+    validation,
     development_time: 'Not requested',
     ext_inter: 'Not requested',
     design_type: 'Not requested',
@@ -1813,13 +2359,15 @@ async function findSubElementForUpdate(productId, elementId, subElementId) {
   }
 }
 
-async function updateProductElement(productId, elementId, payload) {
+async function updateProductElement(productId, elementId, payload, authenticatedUser = null) {
   const { element, productId: resolvedProductId } = await findElementForUpdate(
     productId,
     elementId,
   )
 
   const updateData = {}
+  const previousStatus = getTrimmedText(element.status)
+  const previousValidation = getTrimmedText(element.validation)
 
   if (hasOwnPayloadField(payload, 'title') || hasOwnPayloadField(payload, 'name')) {
     updateData.title = normalizeRequiredText(payload?.title ?? payload?.name, 'Element title')
@@ -1915,14 +2463,12 @@ async function updateProductElement(productId, elementId, payload) {
   }
 
   if (hasOwnPayloadField(payload, 'validation')) {
-    updateData.validation = normalizeEnumValue(
-      payload?.validation,
-      ElementProductDesign.VALIDATION_STATUS_VALUES,
-      {
-        fieldLabel: 'Validation',
-        allowNull: false,
-      },
-    )
+    updateData.validation = getNormalizedElementValidationValue(payload?.validation)
+    ensureValidationUpdatePermission(element, updateData.validation, authenticatedUser)
+    // Business rule: if validation is "Validated", automatically set status to "Done"
+    if (updateData.validation === 'Validated') {
+      updateData.status = 'Done'
+    }
   }
 
   if (
@@ -2014,15 +2560,147 @@ async function updateProductElement(productId, elementId, payload) {
     return getSerializedProductById(resolvedProductId)
   }
 
-  await element.update(updateData)
+  logProductDevelopmentValidation('info', 'element-product-design update called', {
+    elementId: Number(element?.id),
+    productId: Number(resolvedProductId),
+    oldStatus: previousStatus || null,
+    newStatus: Object.prototype.hasOwnProperty.call(updateData, 'status')
+      ? updateData.status
+      : null,
+    shouldSendLeaderEmail:
+      Object.prototype.hasOwnProperty.call(updateData, 'status') &&
+      normalizeEnumLookupKey(previousStatus) !== normalizeEnumLookupKey(updateData.status) &&
+      updateData.status === 'Need to be Validated',
+    oldValidationStatus: previousValidation || null,
+    requestedValidationStatus: hasOwnPayloadField(payload, 'validation')
+      ? payload?.validation ?? null
+      : null,
+    normalizedValidationStatus: Object.prototype.hasOwnProperty.call(updateData, 'validation')
+      ? updateData.validation
+      : null,
+    requestedStatus: hasOwnPayloadField(payload, 'status') ? payload?.status ?? null : null,
+    normalizedStatus: Object.prototype.hasOwnProperty.call(updateData, 'status')
+      ? updateData.status
+      : null,
+  })
+
+  const transaction = await ProductDevelopmentProduct.sequelize.transaction()
+
+  try {
+    await element.update(updateData, { transaction })
+
+    if (Object.prototype.hasOwnProperty.call(updateData, 'status')) {
+      await triggerElementStatusValidationWorkflow({
+        element,
+        previousStatus,
+        nextStatus: updateData.status,
+        transaction,
+      })
+    }
+
+    if (Object.prototype.hasOwnProperty.call(updateData, 'validation')) {
+      await triggerElementValidationWorkflow({
+        element,
+        previousValidation,
+        nextValidation: updateData.validation,
+        transaction,
+      })
+    }
+
+    await transaction.commit()
+  } catch (error) {
+    await transaction.rollback()
+    throw error
+  }
 
   return getSerializedProductById(resolvedProductId)
 }
 
-async function updateElement(elementId, payload) {
+async function updateElement(elementId, payload, authenticatedUser = null) {
   const { element, productId } = await findElementForUpdate(null, elementId)
 
-  return updateProductElement(productId, element.id, payload)
+  return updateProductElement(productId, element.id, payload, authenticatedUser)
+}
+
+async function approveElementValidationByToken(token) {
+  const normalizedToken = getTrimmedText(token)
+
+  if (!normalizedToken) {
+    throw createHttpError(400, 'Validation token is required.')
+  }
+
+  const payload = userService.verifySignedToken(normalizedToken)
+
+  if (
+    payload.type !== 'product-development-validation-approve' ||
+    payload.action !== 'validate'
+  ) {
+    throw createHttpError(400, 'Invalid validation token.')
+  }
+
+  const element = await ElementProductDesign.findOne({
+    where: {
+      id: Number(payload.elementId),
+      validation_approval_token: normalizedToken,
+    },
+  })
+
+  if (!element) {
+    throw createHttpError(404, 'Invalid or expired validation token.')
+  }
+
+  if (
+    element.validation_approval_token_expires_at &&
+    new Date() > new Date(element.validation_approval_token_expires_at)
+  ) {
+    throw createHttpError(410, 'Validation token has expired.')
+  }
+
+  if (element.validation_approval_token_used_at) {
+    throw createHttpError(410, 'Validation token has already been used.')
+  }
+
+  const leaderUser = await resolveApprovedUserByAssignmentValue(element.leader)
+
+  if (!leaderUser) {
+    throw createHttpError(400, 'The assigned leader could not be resolved anymore.')
+  }
+
+  if (
+    Number(leaderUser.id) !== Number(payload.leaderId) ||
+    normalizeLookupKey(leaderUser.email) !== normalizeLookupKey(payload.leaderEmail)
+  ) {
+    throw createHttpError(403, 'This validation token is not valid for the current leader.')
+  }
+
+  const transaction = await ProductDevelopmentProduct.sequelize.transaction()
+
+  try {
+    await element.update(
+      {
+        validation: 'Validated',
+        status: 'Done', // Business rule: when validation is "Validated", status becomes "Done"
+        validation_approval_token: null,
+        validation_approval_token_expires_at: null,
+        validation_approval_token_used_at: new Date(),
+      },
+      { transaction },
+    )
+
+    await transaction.commit()
+  } catch (error) {
+    await transaction.rollback()
+    throw error
+  }
+
+  const product = await getSerializedProductById(element.product_development_product_id)
+
+  return {
+    message: 'Task validated successfully.',
+    product,
+    elementId: element.id,
+    validation: 'Validated',
+  }
 }
 
 async function updateProductSubElement(productId, elementId, subElementId, payload) {
@@ -2360,9 +3038,11 @@ module.exports = {
   DEFAULT_PRODUCT_ELEMENT_TITLES,
   DEFAULT_PRODUCT_SUB_ELEMENT_TEMPLATES,
   getAllProducts,
+  getProductById,
   createProduct,
   updateProduct,
   createProductElement,
+  approveElementValidationByToken,
   createProductSubElement,
   updateProductElement,
   updateElement,

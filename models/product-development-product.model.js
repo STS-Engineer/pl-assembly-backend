@@ -18,9 +18,14 @@ const ProductDevelopmentProduct = sequelize.define(
       type: DataTypes.STRING,
       allowNull: false,
     },
-    deadline: {
+    creation_date: {
       type: DataTypes.DATEONLY,
       allowNull: false,
+    },
+    project_status: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: 'in progress',
     },
     created_by_email: {
       type: DataTypes.STRING,
